@@ -29,12 +29,7 @@ DISCORD_REDIRECT_URI=https://your-project-name.up.railway.app/auth/callback
 SECRET_KEY=super-secret-random-key-change-this-in-production
 ```
 
-**Optional** (only if running the scanner bot):
-```
-DISCORD_BOT_TOKEN=your_bot_token
-CHANNEL_SMALL=your_channel_id
-CHANNEL_MID=your_channel_id
-```
+**Note**: `DISCORD_BOT_TOKEN`, `CHANNEL_SMALL`, and `CHANNEL_MID` are **optional** - only needed if you want to run the stock scanner bot alongside the calendar.
 
 ### 4. Update Discord OAuth2
 - Copy your Railway URL (ends with `.up.railway.app`)
