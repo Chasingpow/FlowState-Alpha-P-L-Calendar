@@ -27,6 +27,10 @@ DISCORD_CLIENT_ID=your_client_id
 DISCORD_CLIENT_SECRET=your_client_secret
 DISCORD_REDIRECT_URI=https://your-project-name.up.railway.app/auth/callback
 SECRET_KEY=super-secret-random-key-change-this-in-production
+```
+
+**Optional** (only if running the scanner bot):
+```
 DISCORD_BOT_TOKEN=your_bot_token
 CHANNEL_SMALL=your_channel_id
 CHANNEL_MID=your_channel_id
