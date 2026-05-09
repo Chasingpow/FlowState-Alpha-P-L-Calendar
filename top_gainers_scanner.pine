@@ -1,0 +1,206 @@
+// @version=5
+// =============================================================================
+// Top Gainers Scanner
+// =============================================================================
+// Add this indicator to any chart, then point it at up to 40 symbols (the Pine
+// Script limit per script). It ranks them by intraday % change vs the prior
+// close, shows a sortable Top-N table on the chart, and fires alerts when any
+// tracked symbol crosses your gain threshold.
+//
+// Pair this with the Python scanner: the Python script writes the Top 15
+// small-cap and mid-cap tickers to a watchlist file every second. Paste those
+// into TradingView (Watchlist -> ... -> Import list from text) and then load
+// this indicator to get a live percentage table on a chart.
+//
+// Two preset bands match the Python scanner:
+//   Small Cap : $1  - $20
+//   Mid Cap   : $5  - $300
+// You can also use "Custom" and supply your own min/max price.
+// =============================================================================
+
+indicator("Top Gainers Scanner", overlay = true, max_labels_count = 100)
+
+// ---- Inputs -----------------------------------------------------------------
+band       = input.string("Small Cap ($1-$20)", "Price band",
+                 options = ["Small Cap ($1-$20)", "Mid Cap ($5-$300)", "Custom"])
+custMin    = input.float(1.0,  "Custom min $", minval = 0.01)
+custMax    = input.float(20.0, "Custom max $", minval = 0.01)
+minGainPct = input.float(3.0,  "Alert threshold (% gain)", step = 0.5)
+topN       = input.int(10,     "Show top N", minval = 1, maxval = 40)
+showTable  = input.bool(true,  "Show table on chart")
+
+// Up to 40 symbols. Leave any slot blank ("") to skip.
+s01 = input.symbol("", "Sym 01", group = "Symbols 01-10")
+s02 = input.symbol("", "Sym 02", group = "Symbols 01-10")
+s03 = input.symbol("", "Sym 03", group = "Symbols 01-10")
+s04 = input.symbol("", "Sym 04", group = "Symbols 01-10")
+s05 = input.symbol("", "Sym 05", group = "Symbols 01-10")
+s06 = input.symbol("", "Sym 06", group = "Symbols 01-10")
+s07 = input.symbol("", "Sym 07", group = "Symbols 01-10")
+s08 = input.symbol("", "Sym 08", group = "Symbols 01-10")
+s09 = input.symbol("", "Sym 09", group = "Symbols 01-10")
+s10 = input.symbol("", "Sym 10", group = "Symbols 01-10")
+s11 = input.symbol("", "Sym 11", group = "Symbols 11-20")
+s12 = input.symbol("", "Sym 12", group = "Symbols 11-20")
+s13 = input.symbol("", "Sym 13", group = "Symbols 11-20")
+s14 = input.symbol("", "Sym 14", group = "Symbols 11-20")
+s15 = input.symbol("", "Sym 15", group = "Symbols 11-20")
+s16 = input.symbol("", "Sym 16", group = "Symbols 11-20")
+s17 = input.symbol("", "Sym 17", group = "Symbols 11-20")
+s18 = input.symbol("", "Sym 18", group = "Symbols 11-20")
+s19 = input.symbol("", "Sym 19", group = "Symbols 11-20")
+s20 = input.symbol("", "Sym 20", group = "Symbols 11-20")
+s21 = input.symbol("", "Sym 21", group = "Symbols 21-30")
+s22 = input.symbol("", "Sym 22", group = "Symbols 21-30")
+s23 = input.symbol("", "Sym 23", group = "Symbols 21-30")
+s24 = input.symbol("", "Sym 24", group = "Symbols 21-30")
+s25 = input.symbol("", "Sym 25", group = "Symbols 21-30")
+s26 = input.symbol("", "Sym 26", group = "Symbols 21-30")
+s27 = input.symbol("", "Sym 27", group = "Symbols 21-30")
+s28 = input.symbol("", "Sym 28", group = "Symbols 21-30")
+s29 = input.symbol("", "Sym 29", group = "Symbols 21-30")
+s30 = input.symbol("", "Sym 30", group = "Symbols 21-30")
+s31 = input.symbol("", "Sym 31", group = "Symbols 31-40")
+s32 = input.symbol("", "Sym 32", group = "Symbols 31-40")
+s33 = input.symbol("", "Sym 33", group = "Symbols 31-40")
+s34 = input.symbol("", "Sym 34", group = "Symbols 31-40")
+s35 = input.symbol("", "Sym 35", group = "Symbols 31-40")
+s36 = input.symbol("", "Sym 36", group = "Symbols 31-40")
+s37 = input.symbol("", "Sym 37", group = "Symbols 31-40")
+s38 = input.symbol("", "Sym 38", group = "Symbols 31-40")
+s39 = input.symbol("", "Sym 39", group = "Symbols 31-40")
+s40 = input.symbol("", "Sym 40", group = "Symbols 31-40")
+
+// Resolve effective min / max
+[loBand, hiBand] = band == "Small Cap ($1-$20)" ? [1.0, 20.0] :
+                   band == "Mid Cap ($5-$300)"  ? [5.0, 300.0] :
+                   [custMin, custMax]
+
+// ---- Helpers ----------------------------------------------------------------
+// Pull current price (last) and prior daily close for one symbol, returning
+// a [symbol, price, gainPct] triple. Inactive slots resolve to ["", na, na].
+getRow(string sym) =>
+    if sym == ""
+        ["", float(na), float(na)]
+    else
+        last = request.security(sym, "1",  close, ignore_invalid_symbol = true)
+        prev = request.security(sym, "D",  close[1], lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+        gp   = (na(last) or na(prev) or prev == 0) ? float(na) : (last - prev) / prev * 100.0
+        [sym, last, gp]
+
+// ---- Pull all rows ---------------------------------------------------------
+[n01, p01, g01] = getRow(s01)
+[n02, p02, g02] = getRow(s02)
+[n03, p03, g03] = getRow(s03)
+[n04, p04, g04] = getRow(s04)
+[n05, p05, g05] = getRow(s05)
+[n06, p06, g06] = getRow(s06)
+[n07, p07, g07] = getRow(s07)
+[n08, p08, g08] = getRow(s08)
+[n09, p09, g09] = getRow(s09)
+[n10, p10, g10] = getRow(s10)
+[n11, p11, g11] = getRow(s11)
+[n12, p12, g12] = getRow(s12)
+[n13, p13, g13] = getRow(s13)
+[n14, p14, g14] = getRow(s14)
+[n15, p15, g15] = getRow(s15)
+[n16, p16, g16] = getRow(s16)
+[n17, p17, g17] = getRow(s17)
+[n18, p18, g18] = getRow(s18)
+[n19, p19, g19] = getRow(s19)
+[n20, p20, g20] = getRow(s20)
+[n21, p21, g21] = getRow(s21)
+[n22, p22, g22] = getRow(s22)
+[n23, p23, g23] = getRow(s23)
+[n24, p24, g24] = getRow(s24)
+[n25, p25, g25] = getRow(s25)
+[n26, p26, g26] = getRow(s26)
+[n27, p27, g27] = getRow(s27)
+[n28, p28, g28] = getRow(s28)
+[n29, p29, g29] = getRow(s29)
+[n30, p30, g30] = getRow(s30)
+[n31, p31, g31] = getRow(s31)
+[n32, p32, g32] = getRow(s32)
+[n33, p33, g33] = getRow(s33)
+[n34, p34, g34] = getRow(s34)
+[n35, p35, g35] = getRow(s35)
+[n36, p36, g36] = getRow(s36)
+[n37, p37, g37] = getRow(s37)
+[n38, p38, g38] = getRow(s38)
+[n39, p39, g39] = getRow(s39)
+[n40, p40, g40] = getRow(s40)
+
+// ---- Collect into arrays ----------------------------------------------------
+var array<string> names  = array.new<string>()
+var array<float>  prices = array.new<float>()
+var array<float>  gains  = array.new<float>()
+
+array.clear(names)
+array.clear(prices)
+array.clear(gains)
+
+push(string n, float p, float g) =>
+    if n != "" and not na(p) and not na(g) and p >= loBand and p <= hiBand
+        array.push(names,  n)
+        array.push(prices, p)
+        array.push(gains,  g)
+
+push(n01, p01, g01), push(n02, p02, g02), push(n03, p03, g03), push(n04, p04, g04)
+push(n05, p05, g05), push(n06, p06, g06), push(n07, p07, g07), push(n08, p08, g08)
+push(n09, p09, g09), push(n10, p10, g10), push(n11, p11, g11), push(n12, p12, g12)
+push(n13, p13, g13), push(n14, p14, g14), push(n15, p15, g15), push(n16, p16, g16)
+push(n17, p17, g17), push(n18, p18, g18), push(n19, p19, g19), push(n20, p20, g20)
+push(n21, p21, g21), push(n22, p22, g22), push(n23, p23, g23), push(n24, p24, g24)
+push(n25, p25, g25), push(n26, p26, g26), push(n27, p27, g27), push(n28, p28, g28)
+push(n29, p29, g29), push(n30, p30, g30), push(n31, p31, g31), push(n32, p32, g32)
+push(n33, p33, g33), push(n34, p34, g34), push(n35, p35, g35), push(n36, p36, g36)
+push(n37, p37, g37), push(n38, p38, g38), push(n39, p39, g39), push(n40, p40, g40)
+
+// ---- Sort indices by gain descending ---------------------------------------
+n = array.size(gains)
+order = array.new<int>()
+for i = 0 to n - 1
+    array.push(order, i)
+
+// Insertion sort on `order` based on `gains` desc - n <= 40 so trivially fast.
+for i = 1 to n - 1
+    j = i
+    while j > 0 and array.get(gains, array.get(order, j)) > array.get(gains, array.get(order, j - 1))
+        tmp = array.get(order, j)
+        array.set(order, j, array.get(order, j - 1))
+        array.set(order, j - 1, tmp)
+        j := j - 1
+
+// ---- Render table -----------------------------------------------------------
+var table tbl = table.new(position.top_right, 4, 41, frame_color = color.gray, frame_width = 1)
+
+if showTable and barstate.islast
+    table.clear(tbl, 0, 0, 3, 40)
+    table.cell(tbl, 0, 0, "#",       text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
+    table.cell(tbl, 1, 0, "Ticker",  text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
+    table.cell(tbl, 2, 0, "Price",   text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
+    table.cell(tbl, 3, 0, "% Gain",  text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
+
+    rows = math.min(topN, n)
+    for r = 0 to rows - 1
+        idx = array.get(order, r)
+        sym = array.get(names, idx)
+        prc = array.get(prices, idx)
+        gn  = array.get(gains, idx)
+        bg  = gn >= minGainPct ? color.new(color.green, 70) : color.new(color.gray, 80)
+        table.cell(tbl, 0, r + 1, str.tostring(r + 1),                    bgcolor = bg, text_color = color.white, text_size = size.small)
+        table.cell(tbl, 1, r + 1, sym,                                    bgcolor = bg, text_color = color.white, text_size = size.small)
+        table.cell(tbl, 2, r + 1, "$" + str.tostring(prc, "#.##"),        bgcolor = bg, text_color = color.white, text_size = size.small)
+        table.cell(tbl, 3, r + 1, str.tostring(gn,  "+#.##") + "%",       bgcolor = bg, text_color = color.white, text_size = size.small)
+
+// ---- Alerts -----------------------------------------------------------------
+// Fires once per bar, per symbol, when any qualifying symbol crosses the
+// threshold. Configure in TradingView: Alerts -> Create alert -> this
+// indicator -> "Any alert() function call".
+for r = 0 to n - 1
+    g = array.get(gains, r)
+    s = array.get(names, r)
+    p = array.get(prices, r)
+    if not na(g) and g >= minGainPct
+        alert("TOP GAINER " + s + " " + str.tostring(p, "#.##") + " (" +
+              str.tostring(g, "+#.##") + "%)", alert.freq_once_per_bar)

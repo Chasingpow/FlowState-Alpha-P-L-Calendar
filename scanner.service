@@ -1,0 +1,20 @@
+[Unit]
+Description=Top Gainer Scanner v2 (Polygon -> Discord embeds + voice + TradingView watchlist)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/top-gainer-scanner
+EnvironmentFile=/home/ubuntu/top-gainer-scanner/.env
+ExecStart=/home/ubuntu/top-gainer-scanner/.venv/bin/python scanner.py
+Restart=always
+RestartSec=5
+# discord.py voice spawns ffmpeg; give it room to breathe
+TimeoutStopSec=20
+StandardOutput=append:/var/log/top-gainer-scanner.log
+StandardError=append:/var/log/top-gainer-scanner.log
+
+[Install]
+WantedBy=multi-user.target
