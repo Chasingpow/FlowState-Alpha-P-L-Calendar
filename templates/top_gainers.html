@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Top Gainers — Flowstate Alpha</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        :root {
+            color-scheme: dark;
+            font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        body {
+            background: #040611;
+            color: #e2e8f0;
+            min-height: 100vh;
+        }
+        .page-shell {
+            max-width: 1520px;
+            margin: 0 auto;
+            padding: 28px 24px;
+        }
+
+        /* ── Header ────────────────────────────────── */
+        .site-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 32px;
+            padding-bottom: 24px;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+            flex-wrap: wrap;
+            gap: 16px;
+        }
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 18px;
+        }
+        .fs-logo {
+            width: 56px;
+            height: 56px;
+            border-radius: 14px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+            font-weight: 900;
+            color: #fff;
+            letter-spacing: -1px;
+            flex-shrink: 0;
+            box-shadow: 0 8px 24px rgba(102, 126, 234, 0.35);
+        }
+        .brand-text h1 {
+            margin: 0;
+            font-size: 1.9rem;
+            font-weight: 900;
+            letter-spacing: -0.03em;
+            background: linear-gradient(135deg, #a78bfa 0%, #818cf8 50%, #38bdf8 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .brand-text p {
+            margin: 2px 0 0;
+            font-size: 0.85rem;
+            color: #64748b;
+            font-weight: 500;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+        .header-right {
+            text-align: right;
+        }
+        .header-right .live-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            background: rgba(34, 197, 94, 0.10);
+            border: 1px solid rgba(34, 197, 94, 0.25);
+            border-radius: 999px;
+            padding: 5px 14px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            color: #4ade80;
+            margin-bottom: 8px;
+        }
+        .live-dot {
+            width: 7px;
+            height: 7px;
+            background: #4ade80;
+            border-radius: 50%;
+            animation: pulse 1.4s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.4; transform: scale(0.85); }
+        }
+        .header-right .datetime {
+            font-size: 1rem;
+            font-weight: 600;
+            color: #cbd5e1;
+        }
+        .header-right .datetime span {
+            color: #64748b;
+            font-weight: 400;
+            font-size: 0.88rem;
+            margin-left: 8px;
+        }
+
+        /* ── Section panels ─────────────────────────── */
+        .section-panel {
+            background: rgba(15, 23, 42, 0.92);
+            border: 1px solid rgba(148, 163, 184, 0.10);
+            border-radius: 22px;
+            overflow: hidden;
+            box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+            margin-bottom: 32px;
+        }
+        .section-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 20px 24px 16px;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+        }
+        .section-head-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .section-accent {
+            width: 4px;
+            height: 28px;
+            border-radius: 99px;
+        }
+        .small-accent { background: linear-gradient(180deg, #a78bfa, #667eea); }
+        .mid-accent   { background: linear-gradient(180deg, #38bdf8, #6366f1); }
+        .section-head h2 {
+            margin: 0;
+            font-size: 1.05rem;
+            font-weight: 800;
+            color: #f1f5f9;
+            letter-spacing: -0.01em;
+        }
+        .section-head .cap-badge {
+            font-size: 0.78rem;
+            font-weight: 600;
+            padding: 3px 10px;
+            border-radius: 999px;
+            letter-spacing: 0.02em;
+        }
+        .small-badge { background: rgba(167, 139, 250, 0.12); color: #a78bfa; border: 1px solid rgba(167,139,250,0.2); }
+        .mid-badge   { background: rgba(56, 189, 248, 0.12);  color: #38bdf8; border: 1px solid rgba(56,189,248,0.2); }
+        .section-head .count-tag {
+            font-size: 0.8rem;
+            color: #64748b;
+        }
+        .last-updated-tag {
+            font-size: 0.78rem;
+            color: #475569;
+        }
+
+        /* ── Table ──────────────────────────────────── */
+        .gainers-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .gainers-table thead tr {
+            border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+        }
+        .gainers-table th {
+            padding: 12px 16px;
+            font-size: 0.72rem;
+            font-weight: 700;
+            color: #475569;
+            text-transform: uppercase;
+            letter-spacing: 0.07em;
+            white-space: nowrap;
+        }
+        .gainers-table th.r { text-align: right; }
+        .gainers-table td {
+            padding: 13px 16px;
+            font-size: 0.88rem;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.05);
+            white-space: nowrap;
+            vertical-align: middle;
+        }
+        .gainers-table tbody tr:last-child td { border-bottom: none; }
+        .gainers-table tbody tr {
+            transition: background 0.15s;
+        }
+        .gainers-table tbody tr:hover {
+            background: rgba(99, 102, 241, 0.06);
+        }
+
+        /* Rank */
+        td.rank {
+            font-size: 0.78rem;
+            font-weight: 700;
+            color: #334155;
+            width: 36px;
+            padding-left: 20px;
+        }
+        /* Symbol */
+        td.sym {
+            font-weight: 800;
+            font-size: 0.93rem;
+            color: #818cf8;
+            letter-spacing: 0.02em;
+        }
+        /* Name */
+        td.name {
+            color: #94a3b8;
+            font-size: 0.84rem;
+            max-width: 200px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        /* Price */
+        td.price {
+            text-align: right;
+            font-weight: 700;
+            color: #f1f5f9;
+            font-variant-numeric: tabular-nums;
+        }
+        /* Change $ */
+        td.chg-abs {
+            text-align: right;
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+        }
+        /* Change % — pill */
+        td.chg-pct {
+            text-align: right;
+        }
+        .pct-pill {
+            display: inline-block;
+            font-weight: 800;
+            font-size: 0.85rem;
+            padding: 3px 10px;
+            border-radius: 6px;
+            font-variant-numeric: tabular-nums;
+            min-width: 72px;
+            text-align: center;
+        }
+        .pos { color: #4ade80; }
+        .neg { color: #f87171; }
+        .pct-pos { background: rgba(74, 222, 128, 0.10); color: #4ade80; }
+        .pct-neg { background: rgba(248, 113, 113, 0.10); color: #f87171; }
+
+        /* Volume / AvgVol / MktCap */
+        td.vol, td.avgvol, td.mktcap {
+            text-align: right;
+            color: #64748b;
+            font-size: 0.84rem;
+            font-variant-numeric: tabular-nums;
+        }
+        td.mktcap { color: #94a3b8; font-weight: 600; }
+
+        /* Loading / empty states */
+        .state-row td {
+            text-align: center;
+            padding: 44px 0;
+            color: #475569;
+            font-size: 0.9rem;
+        }
+        .spinner {
+            display: inline-block;
+            width: 18px;
+            height: 18px;
+            border: 2px solid rgba(99,102,241,0.2);
+            border-top-color: #818cf8;
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* ── Footer bar ─────────────────────────────── */
+        .footer-bar {
+            text-align: center;
+            padding: 20px 0 8px;
+            color: #334155;
+            font-size: 0.78rem;
+        }
+        .footer-bar a { color: #4f46e5; text-decoration: none; }
+    </style>
+</head>
+<body>
+<div class="page-shell">
+
+    <!-- Header -->
+    <header class="site-header">
+        <div class="brand">
+            <div class="fs-logo">FS</div>
+            <div class="brand-text">
+                <h1>Flowstate Alpha</h1>
+                <p>Top Gainers &nbsp;·&nbsp; Live Market Scanner</p>
+            </div>
+        </div>
+        <div class="header-right">
+            <div class="live-badge">
+                <div class="live-dot"></div>
+                Live &nbsp;·&nbsp; Refreshing every 1s
+            </div>
+            <div class="datetime" id="hdrDate">—<span id="hdrTime">—</span></div>
+        </div>
+    </header>
+
+    <!-- Small Cap -->
+    <div class="section-panel">
+        <div class="section-head">
+            <div class="section-head-left">
+                <div class="section-accent small-accent"></div>
+                <h2>🚀 Small Cap Top Gainers</h2>
+                <span class="cap-badge small-badge">Market Cap &lt; $2B</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:16px;">
+                <span class="count-tag" id="smallCount">—</span>
+                <span class="last-updated-tag" id="smallUpdated">—</span>
+            </div>
+        </div>
+        <table class="gainers-table">
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Symbol</th>
+                    <th>Name</th>
+                    <th class="r">Price</th>
+                    <th class="r">Change $</th>
+                    <th class="r">Change %</th>
+                    <th class="r">Volume</th>
+                    <th class="r">Avg Vol (3M)</th>
+                    <th class="r">Mkt Cap</th>
+                </tr>
+            </thead>
+            <tbody id="smallBody">
+                <tr class="state-row"><td colspan="9"><span class="spinner"></span>Loading live data…</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Mid Cap -->
+    <div class="section-panel">
+        <div class="section-head">
+            <div class="section-head-left">
+                <div class="section-accent mid-accent"></div>
+                <h2>📈 Mid Cap Top Gainers</h2>
+                <span class="cap-badge mid-badge">Market Cap $2B – $10B</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:16px;">
+                <span class="count-tag" id="midCount">—</span>
+                <span class="last-updated-tag" id="midUpdated">—</span>
+            </div>
+        </div>
+        <table class="gainers-table">
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Symbol</th>
+                    <th>Name</th>
+                    <th class="r">Price</th>
+                    <th class="r">Change $</th>
+                    <th class="r">Change %</th>
+                    <th class="r">Volume</th>
+                    <th class="r">Avg Vol (3M)</th>
+                    <th class="r">Mkt Cap</th>
+                </tr>
+            </thead>
+            <tbody id="midBody">
+                <tr class="state-row"><td colspan="9"><span class="spinner"></span>Loading live data…</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="footer-bar">
+        Flowstate Alpha &nbsp;·&nbsp; Data via Polygon.io &nbsp;·&nbsp; Not financial advice. Trade at your own risk.
+    </div>
+</div>
+
+<script>
+    /* ── Clock ─────────────────────────────── */
+    function tickClock() {
+        const now = new Date();
+        document.getElementById('hdrDate').firstChild.textContent = now.toLocaleDateString('en-US', {
+            weekday: 'short', month: 'short', day: 'numeric', year: 'numeric'
+        });
+        document.getElementById('hdrTime').textContent = ' ' + now.toLocaleTimeString('en-US', {
+            hour: '2-digit', minute: '2-digit', second: '2-digit'
+        });
+    }
+    tickClock();
+    setInterval(tickClock, 1000);
+
+    /* ── Helpers ───────────────────────────── */
+    function fmtPrice(p) {
+        if (p === null || p === undefined) return '—';
+        return '$' + Number(p).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    function fmtChg(c) {
+        if (c === null || c === undefined) return '—';
+        const sign = c >= 0 ? '+' : '';
+        return sign + '$' + Math.abs(c).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    function relativeTime(isoStr) {
+        if (!isoStr) return '';
+        const diff = Math.round((Date.now() - new Date(isoStr).getTime()) / 1000);
+        if (diff < 5)  return 'just now';
+        if (diff < 60) return diff + 's ago';
+        return Math.floor(diff / 60) + 'm ago';
+    }
+
+    /* ── Row builder ───────────────────────── */
+    function buildRow(g, rank) {
+        const pos = g.change_pct >= 0;
+        const signClass = pos ? 'pos' : 'neg';
+        const pctClass  = pos ? 'pct-pos' : 'pct-neg';
+        const pctSign   = pos ? '+' : '';
+        return `<tr>
+            <td class="rank">${rank}</td>
+            <td class="sym">${g.symbol}</td>
+            <td class="name" title="${g.name}">${g.name}</td>
+            <td class="price">${fmtPrice(g.price)}</td>
+            <td class="chg-abs ${signClass}">${fmtChg(g.change)}</td>
+            <td class="chg-pct"><span class="pct-pill ${pctClass}">${pctSign}${Number(g.change_pct).toFixed(2)}%</span></td>
+            <td class="vol">${g.volume}</td>
+            <td class="avgvol">${g.avg_vol_3m}</td>
+            <td class="mktcap">${g.market_cap}</td>
+        </tr>`;
+    }
+
+    /* ── Fetch & render ────────────────────── */
+    async function refresh(capType) {
+        let data;
+        try {
+            const r = await fetch(`/api/top_gainers?cap_type=${capType}`);
+            data = await r.json();
+        } catch (e) {
+            return;
+        }
+
+        const gainers = data.gainers || [];
+        const tbody = document.getElementById(capType === 'small' ? 'smallBody' : 'midBody');
+        const countEl = document.getElementById(capType === 'small' ? 'smallCount' : 'midCount');
+        const updEl   = document.getElementById(capType === 'small' ? 'smallUpdated' : 'midUpdated');
+
+        if (gainers.length === 0) {
+            tbody.innerHTML = `<tr class="state-row"><td colspan="9">No data yet — first load takes ~30 seconds</td></tr>`;
+        } else {
+            tbody.innerHTML = gainers.map((g, i) => buildRow(g, i + 1)).join('');
+        }
+
+        countEl.textContent = gainers.length > 0 ? `Top ${gainers.length}` : '';
+        updEl.textContent   = data.last_updated ? 'Updated ' + relativeTime(data.last_updated) : '';
+    }
+
+    async function refreshAll() {
+        await Promise.all([refresh('small'), refresh('mid')]);
+    }
+
+    refreshAll();
+    setInterval(refreshAll, 1000);
+</script>
+</body>
+</html>

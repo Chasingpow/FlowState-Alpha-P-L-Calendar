@@ -85,6 +85,7 @@ class PolygonClient:
         self.session = session
         self._details_cache = _TtlCache(60 * 60 * 24)   # 24h
         self._avgvol_cache = _TtlCache(60 * 60 * 24)    # 24h
+        self._avgvol3m_cache = _TtlCache(60 * 60 * 24)  # 24h
         self._news_cache = _TtlCache(60 * 5)            # 5m
 
     async def _get(self, path: str, params: dict | None = None,
@@ -161,6 +162,29 @@ class PolygonClient:
             return None
         avg = sum(vols) / len(vols)
         self._avgvol_cache.set(symbol, avg)
+        return avg
+
+    async def avg_volume_3m(self, symbol: str) -> Optional[float]:
+        """Average daily volume over the last ~65 trading days (3 months), cached daily."""
+        cached = self._avgvol3m_cache.get(symbol)
+        if cached is not None:
+            return cached
+        from datetime import datetime, timedelta, timezone
+        end = datetime.now(timezone.utc).date()
+        start = end - timedelta(days=100)  # 100 calendar days ensures ~65 trading days
+        path = f"/v2/aggs/ticker/{symbol}/range/1/day/{start.isoformat()}/{end.isoformat()}"
+        try:
+            data = await self._get(path, {"adjusted": "true", "sort": "desc", "limit": 70})
+        except PolygonError:
+            return None
+        results = (data or {}).get("results") or []
+        if not results:
+            return None
+        vols = [r.get("v") for r in results if r.get("v")][:65]
+        if not vols:
+            return None
+        avg = sum(vols) / len(vols)
+        self._avgvol3m_cache.set(symbol, avg)
         return avg
 
     async def latest_news(self, symbol: str, hours: int = 24) -> Optional[NewsItem]:

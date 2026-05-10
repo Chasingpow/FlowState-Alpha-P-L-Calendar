@@ -7,9 +7,20 @@ watchlist file.
 from __future__ import annotations
 import asyncio, json, logging, os, signal, sys, time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from typing import Optional
 import aiohttp
+
+_ET = ZoneInfo("America/New_York")
+
+def _is_trading_session() -> bool:
+    """True Mon–Fri 4:00 AM – 8:00 PM ET (covers premarket, regular, after-hours)."""
+    now = datetime.now(_ET)
+    if now.weekday() >= 5:          # Saturday=5, Sunday=6
+        return False
+    mins = now.hour * 60 + now.minute
+    return 4 * 60 <= mins <= 20 * 60   # 4:00am–8:00pm
 
 try:
     from dotenv import load_dotenv; load_dotenv()
@@ -229,7 +240,28 @@ async def _polling_loop(polygon, bot, state, stop_evt):
     consecutive_errors = 0
     poll_count = 0
     log.info("Polling loop started - interval=%.1fs", POLL_INTERVAL_SEC)
+    _last_session_date: date | None = None
     while not stop_evt.is_set():
+        if not _is_trading_session():
+            # Market closed — sleep quietly and check again in 60s
+            try:
+                await asyncio.wait_for(stop_evt.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                pass
+            continue
+
+        # First poll of a new trading day — wipe stale intraday state
+        today = date.today()
+        if _last_session_date != today:
+            _last_session_date = today
+            for st in state.values():
+                st.last_high_of_day = 0.0
+                st.nhod_streak = 0
+                st.last_alert_grade = None
+                st.last_alert_time = 0.0
+                st.last_followup_time = 0.0
+            log.info("New session %s — intraday state cleared.", today)
+
         loop_start = time.time()
         try:
             tickers = await polygon.snapshot_all_us()
