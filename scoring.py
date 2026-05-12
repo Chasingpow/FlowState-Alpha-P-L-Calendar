@@ -6,8 +6,8 @@ from typing import Optional
 
 @dataclass
 class ScoringConfig:
-    rvol_threshold: float = 3.0
-    gap_threshold_pct: float = 3.0
+    rvol_threshold: float = 1.5   # was 3.0 — large stocks rarely 3x avg vol on a big day
+    gap_threshold_pct: float = 2.0  # was 3.0 — catches intraday runners without full gap
     volume_threshold: int = 500_000
     tech_proximity_pct: float = 1.0
     nhod_proximity_pct: float = 0.05

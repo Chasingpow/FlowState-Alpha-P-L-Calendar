@@ -167,6 +167,28 @@ def build_embed(p: AlertPayload) -> discord.Embed:
     return embed
 
 
+def build_compact_embed(p: AlertPayload) -> discord.Embed:
+    """Minimal one-field embed for C-grade alerts — keeps the channel clean."""
+    arrow = "▲" if p.change_pct >= 0 else "▼"
+    band_emoji = "🟢" if p.is_small_cap else "🟣"
+    rvol_str = f"{p.score.rvol_value:.1f}x" if p.score.rvol_value else "—"
+    gap_str = f"{p.gap_pct:+.1f}%" if p.gap_pct is not None else "—"
+    news_tag = "  📰" if p.news else ""
+    title = (
+        f"C  |  {p.symbol}  |  {arrow} {p.change_pct:+.2f}%  |  "
+        f"${p.last_price:.2f}  |  {band_emoji} {p.band_label}{news_tag}"
+    )
+    stats = (
+        f"Vol: **{_fmt_volume(p.todays_volume)}**  ·  "
+        f"RVOL: **{rvol_str}**  ·  "
+        f"Gap: **{gap_str}**"
+    )
+    embed = discord.Embed(title=title, color=GRADE_COLORS.get("C", 0x95A5A6),
+                          timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="​", value=stats, inline=False)
+    return embed
+
+
 def build_followup_line(symbol: str, change_pct: float, streak: int,
                         is_nhod: bool) -> str:
     fire = "🔥" * min(streak, 5) if streak else ""
@@ -202,6 +224,10 @@ class ScannerBot:
         self._voice: Optional[discord.VoiceClient] = None
         self._ready_evt = asyncio.Event()
         self._tts_lock = asyncio.Lock()
+        # Priority slot: holds the single best-grade clip waiting to play next.
+        # A higher-grade clip always bumps a lower-grade one that's waiting.
+        self._tts_pending: Optional[str] = None
+        self._tts_pending_rank: int = -1
 
         @self.client.event
         async def on_ready():
@@ -231,42 +257,59 @@ class ScannerBot:
         except Exception as e:  # noqa: BLE001
             log.warning("Voice connect failed: %s", e)
 
-    async def _speak(self, phrase: str) -> None:
+    _GRADE_RANK = {"C": 0, "B": 1, "A": 2, "A+": 3}
+
+    async def _play_phrase(self, phrase: str) -> None:
+        """Synthesise and play one TTS clip. Must be called with _tts_lock held."""
+        await self._ensure_voice()
+        if not (self._voice and self._voice.is_connected()):
+            return
+        mp3 = await asyncio.to_thread(tts_mod.synthesize, phrase)
+        if not mp3:
+            return
+        try:
+            done = asyncio.Event()
+
+            def after(err):
+                if err:
+                    log.warning("Voice playback error: %s", err)
+                self.client.loop.call_soon_threadsafe(done.set)
+
+            source = discord.FFmpegPCMAudio(mp3, options="-loglevel quiet")
+            self._voice.play(source, after=after)
+            await asyncio.wait_for(done.wait(), timeout=30)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Failed to play voice alert: %s", e)
+        finally:
+            try:
+                os.remove(mp3)
+            except OSError:
+                pass
+
+    async def _speak(self, phrase: str, grade: str = "C") -> None:
         if not self.voice_channel_id:
             return
+        rank = self._GRADE_RANK.get(grade, 0)
         if self._tts_lock.locked():
-            log.debug("Voice busy — dropping queued clip: %s", phrase[:40])
+            # Keep only the highest-grade clip waiting — A+ always beats B in the queue
+            if rank > self._tts_pending_rank:
+                self._tts_pending = phrase
+                self._tts_pending_rank = rank
+                log.debug("Voice busy — queued grade=%s clip (bumped lower)", grade)
+            else:
+                log.debug("Voice busy — dropping grade=%s (lower than pending)", grade)
             return
         async with self._tts_lock:
-            await self._ensure_voice()
-            if not (self._voice and self._voice.is_connected()):
-                log.debug("No voice client; skipping TTS.")
-                return
-            mp3 = await asyncio.to_thread(tts_mod.synthesize, phrase)
-            if not mp3:
-                return
-            try:
-                done = asyncio.Event()
+            await self._play_phrase(phrase)
+            # After current clip, drain the priority slot once
+            if self._tts_pending is not None:
+                pending, self._tts_pending = self._tts_pending, None
+                self._tts_pending_rank = -1
+                await self._play_phrase(pending)
 
-                def after(err):
-                    if err:
-                        log.warning("Voice playback error: %s", err)
-                    self.client.loop.call_soon_threadsafe(done.set)
-
-                source = discord.FFmpegPCMAudio(mp3, options="-loglevel quiet")
-                self._voice.play(source, after=after)
-                await asyncio.wait_for(done.wait(), timeout=30)
-            except Exception as e:  # noqa: BLE001
-                log.warning("Failed to play voice alert: %s", e)
-            finally:
-                try:
-                    os.remove(mp3)
-                except OSError:
-                    pass
-
-    async def _speak_repeat(self, phrase: str, times: int) -> None:
+    async def _speak_repeat(self, phrase: str, times: int, grade: str = "C") -> None:
         for _ in range(times):
-            await self._speak(phrase)
+            await self._speak(phrase, grade)
 
     # -- public API ------------------------------------------------------
     async def start_in_background(self) -> asyncio.Task:
@@ -300,8 +343,10 @@ class ScannerBot:
         ch = await self._channel(target_id)
         if not ch:
             return None
+        embed = (build_compact_embed(payload) if payload.score.grade == "C"
+                 else build_embed(payload))
         try:
-            msg = await ch.send(embed=build_embed(payload))
+            msg = await ch.send(embed=embed)
         except discord.HTTPException as e:
             log.warning("Failed to send embed: %s", e)
             return None
@@ -316,7 +361,9 @@ class ScannerBot:
                 is_small_cap=payload.is_small_cap,
             )
             repeats = 3 if payload.score.grade == "A+" else 1
-            asyncio.create_task(self._speak_repeat(phrase, repeats))
+            asyncio.create_task(
+                self._speak_repeat(phrase, repeats, grade=payload.score.grade)
+            )
 
         return msg.id
 

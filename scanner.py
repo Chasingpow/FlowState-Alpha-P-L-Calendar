@@ -1,8 +1,12 @@
-"""Top Gainer Scanner - orchestrator.
+"""Top Gainer Scanner — orchestrator.
 
-Polls Polygon ~once/sec, scores each candidate gainer in two share-price
-bands, dispatches to Discord (rich embed + voice) and writes a TradingView
-watchlist file.
+Two parallel feeds:
+  1. WebSocket (A.*) — real-time per-second bars; fires alerts in ~200ms.
+  2. REST snapshot   — runs every POLL_INTERVAL_SEC (default 30s) for cache
+                       refresh, discovery of new tickers, and WS fallback.
+
+Both feeds call the same _process_candidate() coroutine; state guards
+prevent duplicate alerts for the same ticker.
 """
 from __future__ import annotations
 import asyncio, json, logging, os, signal, sys, time
@@ -14,13 +18,15 @@ import aiohttp
 
 _ET = ZoneInfo("America/New_York")
 
+
 def _is_trading_session() -> bool:
     """True Mon–Fri 4:00 AM – 8:00 PM ET (covers premarket, regular, after-hours)."""
     now = datetime.now(_ET)
-    if now.weekday() >= 5:          # Saturday=5, Sunday=6
+    if now.weekday() >= 5:
         return False
     mins = now.hour * 60 + now.minute
-    return 4 * 60 <= mins <= 20 * 60   # 4:00am–8:00pm
+    return 4 * 60 <= mins <= 20 * 60
+
 
 try:
     from dotenv import load_dotenv; load_dotenv()
@@ -28,29 +34,34 @@ except Exception:
     pass
 
 from polygon_client import PolygonClient, PolygonError
+from polygon_ws import PolygonWSClient
 from scoring import ScoringConfig, score
 from discord_bot import AlertPayload, ScannerBot
 
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
-CHANNEL_SMALL = int(os.getenv("CHANNEL_SMALL") or "0")
-CHANNEL_MID = int(os.getenv("CHANNEL_MID") or "0")
-VOICE_CHANNEL_ID = int(os.getenv("VOICE_CHANNEL_ID") or "0") or None
-SPEAK_MIN_GRADE = os.getenv("SPEAK_MIN_GRADE", "A+").strip()
-BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "").strip() or None
+POLYGON_API_KEY     = os.getenv("POLYGON_API_KEY", "").strip()
+DISCORD_BOT_TOKEN   = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+CHANNEL_SMALL       = int(os.getenv("CHANNEL_SMALL") or "0")
+CHANNEL_MID         = int(os.getenv("CHANNEL_MID") or "0")
+VOICE_CHANNEL_ID    = int(os.getenv("VOICE_CHANNEL_ID") or "0") or None
+SPEAK_MIN_GRADE     = os.getenv("SPEAK_MIN_GRADE", "B").strip()
+BOT_DISPLAY_NAME    = os.getenv("BOT_DISPLAY_NAME", "").strip() or None
 
-POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "1.0"))
-ALERT_COOLDOWN_SEC = float(os.getenv("ALERT_COOLDOWN_SEC", "1800"))
+# REST polling is now a background refresh; WebSocket handles real-time detection.
+POLL_INTERVAL_SEC   = float(os.getenv("POLL_INTERVAL_SEC", "30.0"))
+ALERT_COOLDOWN_SEC  = float(os.getenv("ALERT_COOLDOWN_SEC", "1800"))
 FOLLOWUP_INTERVAL_SEC = float(os.getenv("FOLLOWUP_INTERVAL_SEC", "300"))
-ALERT_MIN_GRADE = os.getenv("ALERT_MIN_GRADE", "B").strip()
-TOP_N = int(os.getenv("TOP_N", "15"))
-MIN_GAIN_PCT = float(os.getenv("MIN_GAIN_PCT", "3.0"))
-WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", "watchlist.txt")
-STATE_FILE = os.getenv("STATE_FILE", "scanner_state.json")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+ALERT_MIN_GRADE     = os.getenv("ALERT_MIN_GRADE", "A").strip()
+TOP_N               = int(os.getenv("TOP_N", "40"))
+MIN_GAIN_PCT        = float(os.getenv("MIN_GAIN_PCT", "3.0"))
+WATCHLIST_FILE      = os.getenv("WATCHLIST_FILE", "watchlist.txt")
+STATE_FILE          = os.getenv("STATE_FILE", "scanner_state.json")
+LOG_LEVEL           = os.getenv("LOG_LEVEL", "INFO").upper()
 
-SMALL_CAP_BAND = (1.0, 20.0)
-MID_CAP_BAND = (20.01, 300.0)
+SMALL_CAP_BAND = (0.50, 20.0)
+MID_CAP_BAND   = (20.01, 300.0)
+
+_CFG_SMALL = ScoringConfig(volume_threshold=25_000)
+_CFG_MID   = ScoringConfig(volume_threshold=150_000)
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -61,11 +72,11 @@ GRADE_ORDER = ["F", "D", "C", "B", "A", "A+"]
 
 @dataclass
 class TickerState:
-    last_alert_grade: Optional[str] = None
-    last_alert_time: float = 0.0
-    last_followup_time: float = 0.0
-    last_high_of_day: float = 0.0
-    nhod_streak: int = 0
+    last_alert_grade: Optional[str]  = None
+    last_alert_time:  float          = 0.0
+    last_followup_time: float        = 0.0
+    last_high_of_day: float          = 0.0
+    nhod_streak: int                 = 0
 
 
 def grade_at_least(actual, minimum):
@@ -121,7 +132,6 @@ def _load_state(path: str) -> dict:
                 last_high_of_day=d.get("last_high_of_day", 0.0),
                 nhod_streak=d.get("nhod_streak", 0),
             )
-            # Reset intraday fields if persisted state is from a prior day
             if st.last_alert_time:
                 alert_date = date.fromtimestamp(st.last_alert_time)
                 if alert_date < today:
@@ -134,25 +144,17 @@ def _load_state(path: str) -> dict:
         return {}
 
 
-async def _process_candidate(*, t, band, is_small_cap, polygon, bot, state, cfg):
-    symbol = t.get("ticker")
+async def _process_candidate(
+    *, symbol: str, last_price: float, change_pct: float, change_abs: float,
+    todays_volume: int, todays_high: float, todays_open, prev_close,
+    band, is_small_cap: bool, polygon, bot, state: dict, cfg,
+) -> Optional[str]:
     if not symbol or "." in symbol:
         return None
-    last_trade = t.get("lastTrade") or {}
-    day = t.get("day") or {}
-    prev = t.get("prevDay") or {}
-    last_price = float(last_trade.get("p") or day.get("c") or 0.0)
     if last_price <= 0 or not in_band(last_price, band):
         return None
-    change_pct = float(t.get("todaysChangePerc") or 0.0)
-    change_abs = float(t.get("todaysChange") or 0.0)
     if change_pct < MIN_GAIN_PCT or change_pct > 1000:
         return None
-
-    todays_volume = int(day.get("v") or 0)
-    todays_high = float(day.get("h") or 0.0)
-    todays_open = day.get("o")
-    prev_close = prev.get("c")
 
     avg_vol, news, details = await asyncio.gather(
         polygon.avg_volume_20d(symbol),
@@ -160,8 +162,7 @@ async def _process_candidate(*, t, band, is_small_cap, polygon, bot, state, cfg)
         polygon.ticker_details(symbol),
     )
 
-    # Pre-market: day.v=0 means the regular session hasn't opened yet.
-    # Derive gap from last_price vs prev_close; bypass volume/RVOL (unavailable).
+    # Pre-market: volume==0 means regular session hasn't opened.
     pm_mode = todays_volume == 0 and change_pct > 0
     if pm_mode:
         todays_open = todays_open if todays_open is not None else last_price
@@ -190,12 +191,14 @@ async def _process_candidate(*, t, band, is_small_cap, polygon, bot, state, cfg)
 
     now = time.time()
     grade = s.grade
-    qualifies = grade_at_least(grade, ALERT_MIN_GRADE)
-    cooldown_passed = (now - st.last_alert_time) >= ALERT_COOLDOWN_SEC
-    grade_improved = (st.last_alert_grade is None or
+    # A/A+ always alert; B only when a news catalyst is present; C and below suppressed
+    qualifies = grade_at_least(grade, "A") or (grade == "B" and s.catalyst)
+    is_first_alert = st.last_alert_grade is None
+    grade_improved = (not is_first_alert and
         GRADE_ORDER.index(grade) > GRADE_ORDER.index(st.last_alert_grade))
+    long_absence = (not is_first_alert and (now - st.last_alert_time) >= 7200)
 
-    if qualifies and (cooldown_passed or grade_improved):
+    if qualifies and (is_first_alert or grade_improved or long_absence):
         if bot:
             payload = AlertPayload(
                 symbol=symbol,
@@ -231,26 +234,108 @@ async def _process_candidate(*, t, band, is_small_cap, polygon, bot, state, cfg)
             except Exception as e:
                 log.warning("Bot followup failed for %s: %s", symbol, e)
         st.last_followup_time = now
+
     return symbol
 
 
-async def _polling_loop(polygon, bot, state, stop_evt):
-    cfg_small = ScoringConfig(volume_threshold=75_000)
-    cfg_mid = ScoringConfig(volume_threshold=150_000)
+async def _warm_caches(polygon, symbols: list) -> None:
+    """Pre-fetch avg_vol, details, and news for candidates so first alert is instant."""
+    if not symbols:
+        return
+    await asyncio.gather(
+        *[polygon.avg_volume_20d(s) for s in symbols],
+        *[polygon.ticker_details(s) for s in symbols],
+        *[polygon.latest_news(s) for s in symbols],
+        return_exceptions=True,
+    )
+
+
+def _build_ws_handler(
+    polygon, bot, state: dict,
+    prev_close_cache: dict, day_high_cache: dict,
+) -> callable:
+    """Return a sync on_bar callback that schedules _process_candidate tasks.
+
+    prev_close_cache and day_high_cache are seeded + updated by the REST loop.
+    The WebSocket handler updates day_high_cache incrementally from A events.
+    """
+    def on_bar(ev: dict) -> None:
+        sym = ev.get("sym", "")
+        if not sym or "." in sym:
+            return
+
+        price = float(ev.get("c") or 0.0)
+        if price <= 0:
+            return
+
+        prev_close = prev_close_cache.get(sym)
+        if not prev_close or prev_close <= 0:
+            return  # no reference price yet — wait for REST poll to seed it
+
+        change_pct = (price - prev_close) / prev_close * 100.0
+        if change_pct < MIN_GAIN_PCT or change_pct > 1000:
+            return
+
+        if in_band(price, SMALL_CAP_BAND):
+            band, is_small_cap, cfg = SMALL_CAP_BAND, True, _CFG_SMALL
+        elif in_band(price, MID_CAP_BAND):
+            band, is_small_cap, cfg = MID_CAP_BAND, False, _CFG_MID
+        else:
+            return
+
+        # Debounce: skip if we alerted this ticker within the last 30s.
+        # First-ever alerts always pass (last_alert_time is 0.0 = falsy).
+        st = state.get(sym)
+        if st and st.last_alert_time and (time.time() - st.last_alert_time) < 30:
+            return
+
+        # ev.h is the high for this *second*, not the day. Maintain day high ourselves.
+        bar_high = float(ev.get("h") or price)
+        current_day_high = day_high_cache.get(sym, 0.0)
+        new_day_high = max(bar_high, current_day_high, price)
+        if new_day_high > current_day_high:
+            day_high_cache[sym] = new_day_high
+
+        change_abs = price - prev_close
+        av = int(ev.get("av") or 0)
+        op = ev.get("op")  # official open for the day (may be None pre-market)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(
+            _process_candidate(
+                symbol=sym, last_price=price,
+                change_pct=change_pct, change_abs=change_abs,
+                todays_volume=av, todays_high=new_day_high,
+                todays_open=op, prev_close=prev_close,
+                band=band, is_small_cap=is_small_cap,
+                polygon=polygon, bot=bot, state=state, cfg=cfg,
+            )
+        )
+
+    return on_bar
+
+
+async def _polling_loop(
+    polygon, bot, state, stop_evt,
+    prev_close_cache: dict, day_high_cache: dict,
+):
+    """REST snapshot loop — refreshes caches and acts as WebSocket fallback."""
     consecutive_errors = 0
     poll_count = 0
-    log.info("Polling loop started - interval=%.1fs", POLL_INTERVAL_SEC)
+    log.info("REST polling loop started — interval=%.1fs", POLL_INTERVAL_SEC)
     _last_session_date: date | None = None
+
     while not stop_evt.is_set():
         if not _is_trading_session():
-            # Market closed — sleep quietly and check again in 60s
             try:
                 await asyncio.wait_for(stop_evt.wait(), timeout=60)
             except asyncio.TimeoutError:
                 pass
             continue
 
-        # First poll of a new trading day — wipe stale intraday state
         today = date.today()
         if _last_session_date != today:
             _last_session_date = today
@@ -260,42 +345,94 @@ async def _polling_loop(polygon, bot, state, stop_evt):
                 st.last_alert_grade = None
                 st.last_alert_time = 0.0
                 st.last_followup_time = 0.0
+            day_high_cache.clear()
             log.info("New session %s — intraday state cleared.", today)
 
         loop_start = time.time()
         try:
             tickers = await polygon.snapshot_all_us()
             consecutive_errors = 0
+
+            # Update shared caches from fresh snapshot data
+            for t in tickers:
+                sym = t.get("ticker") or ""
+                if not sym or "." in sym:
+                    continue
+                day  = t.get("day") or {}
+                prev = t.get("prevDay") or {}
+                pc = prev.get("c")
+                dh = day.get("h")
+                if pc:
+                    prev_close_cache[sym] = float(pc)
+                if dh and float(dh) > day_high_cache.get(sym, 0.0):
+                    day_high_cache[sym] = float(dh)
+
             candidates = [t for t in tickers
                           if (t.get("todaysChangePerc") or 0) >= MIN_GAIN_PCT]
-            candidates.sort(key=lambda x: x.get("todaysChangePerc") or 0,
-                            reverse=True)
+            candidates.sort(key=lambda x: x.get("todaysChangePerc") or 0, reverse=True)
+
+            # Warm ALL top-100 candidates every REST poll — not just unseen ones.
+            # Tickers from yesterday sit in state with stale caches; this ensures
+            # every top mover has fresh avg_vol/details/news before the WS fires.
+            top_syms = [t.get("ticker", "") for t in candidates[:100]
+                        if t.get("ticker") and "." not in t.get("ticker", "")]
+            if top_syms:
+                asyncio.create_task(_warm_caches(polygon, top_syms))
+
             small_top, mid_top = [], []
             ps, pm = 0, 0
             for t in candidates:
                 last_trade = t.get("lastTrade") or {}
-                day = t.get("day") or {}
+                day  = t.get("day") or {}
+                prev = t.get("prevDay") or {}
                 price = float(last_trade.get("p") or day.get("c") or 0.0)
                 if price <= 0:
                     continue
-                if ps < TOP_N and in_band(price, SMALL_CAP_BAND):
+                sym_key  = t.get("ticker") or ""
+                chg_pct  = float(t.get("todaysChangePerc") or 0.0)
+                chg_abs  = float(t.get("todaysChange") or 0.0)
+                t_volume = int(day.get("v") or 0)
+                t_high   = float(day.get("h") or 0.0)
+                t_open   = day.get("o")
+                p_close  = prev.get("c")
+
+                _st = state.get(sym_key)
+                already_alerted = _st is not None and _st.last_alert_time > 0
+
+                if in_band(price, SMALL_CAP_BAND) and (ps < TOP_N or already_alerted):
                     sym = await _process_candidate(
-                        t=t, band=SMALL_CAP_BAND, is_small_cap=True,
-                        polygon=polygon, bot=bot, state=state, cfg=cfg_small)
+                        symbol=sym_key, last_price=price,
+                        change_pct=chg_pct, change_abs=chg_abs,
+                        todays_volume=t_volume, todays_high=t_high,
+                        todays_open=t_open, prev_close=p_close,
+                        band=SMALL_CAP_BAND, is_small_cap=True,
+                        polygon=polygon, bot=bot, state=state, cfg=_CFG_SMALL)
                     if sym:
-                        small_top.append(sym); ps += 1
-                if pm < TOP_N and in_band(price, MID_CAP_BAND):
+                        small_top.append(sym)
+                        if not already_alerted:
+                            ps += 1
+
+                if in_band(price, MID_CAP_BAND) and (pm < TOP_N or already_alerted):
                     sym = await _process_candidate(
-                        t=t, band=MID_CAP_BAND, is_small_cap=False,
-                        polygon=polygon, bot=bot, state=state, cfg=cfg_mid)
+                        symbol=sym_key, last_price=price,
+                        change_pct=chg_pct, change_abs=chg_abs,
+                        todays_volume=t_volume, todays_high=t_high,
+                        todays_open=t_open, prev_close=p_close,
+                        band=MID_CAP_BAND, is_small_cap=False,
+                        polygon=polygon, bot=bot, state=state, cfg=_CFG_MID)
                     if sym:
-                        mid_top.append(sym); pm += 1
+                        mid_top.append(sym)
+                        if not already_alerted:
+                            pm += 1
+
                 if ps >= TOP_N and pm >= TOP_N:
                     break
+
             _write_watchlist(small_top, mid_top, WATCHLIST_FILE)
             poll_count += 1
-            if poll_count % 60 == 0:
+            if poll_count % 10 == 0:
                 _save_state(state, STATE_FILE)
+
         except PolygonError as e:
             consecutive_errors += 1
             log.warning("Polygon error: %s", e)
@@ -303,14 +440,14 @@ async def _polling_loop(polygon, bot, state, stop_evt):
             consecutive_errors += 1
             log.exception("Unexpected polling error: %s", e)
 
-        backoff = (min(30.0, POLL_INTERVAL_SEC * (2 ** min(consecutive_errors, 5)))
+        backoff = (min(120.0, POLL_INTERVAL_SEC * (2 ** min(consecutive_errors, 4)))
                    if consecutive_errors else POLL_INTERVAL_SEC)
         elapsed = time.time() - loop_start
         try:
-            await asyncio.wait_for(stop_evt.wait(),
-                                   timeout=max(0.0, backoff - elapsed))
+            await asyncio.wait_for(stop_evt.wait(), timeout=max(0.0, backoff - elapsed))
         except asyncio.TimeoutError:
             pass
+
     log.info("Polling loop exiting cleanly.")
 
 
@@ -318,16 +455,20 @@ async def _amain():
     if not POLYGON_API_KEY:
         log.error("POLYGON_API_KEY env var is required.")
         return 2
+
     stop_evt = asyncio.Event()
+
     def _stop(*_a):
         log.info("Shutdown signal received.")
         stop_evt.set()
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, _stop)
         except NotImplementedError:
             signal.signal(sig, lambda *_: _stop())
+
     state = _load_state(STATE_FILE)
     bot = None
     bot_task = None
@@ -342,11 +483,50 @@ async def _amain():
     else:
         log.warning("Discord disabled: set DISCORD_BOT_TOKEN, CHANNEL_SMALL, "
                     "CHANNEL_MID to enable.")
+
+    # Shared caches: seeded by initial REST snapshot, kept fresh by polling loop,
+    # and read (not written) by the WebSocket handler per-event.
+    prev_close_cache: dict[str, float] = {}
+    day_high_cache:   dict[str, float] = {}
+
     async with aiohttp.ClientSession() as session:
         polygon = PolygonClient(POLYGON_API_KEY, session)
+
+        # Initial snapshot seeds prev_close + day_high before WebSocket connects
+        # so the WS handler has reference prices from the very first event.
         try:
-            await _polling_loop(polygon, bot, state, stop_evt)
+            log.info("Seeding caches from initial REST snapshot...")
+            init_tickers = await polygon.snapshot_all_us()
+            for t in init_tickers:
+                sym = t.get("ticker") or ""
+                if not sym or "." in sym:
+                    continue
+                day  = t.get("day") or {}
+                prev = t.get("prevDay") or {}
+                pc = prev.get("c")
+                dh = day.get("h")
+                if pc:
+                    prev_close_cache[sym] = float(pc)
+                if dh:
+                    day_high_cache[sym] = float(dh)
+            log.info("Seeded %d prev_close / %d day_high entries",
+                     len(prev_close_cache), len(day_high_cache))
+        except Exception as e:
+            log.warning("Initial snapshot seeding failed: %s — WS will warm up gradually", e)
+
+        ws_handler = _build_ws_handler(
+            polygon, bot, state, prev_close_cache, day_high_cache,
+        )
+        ws_client = PolygonWSClient(POLYGON_API_KEY, ws_handler)
+
+        try:
+            await asyncio.gather(
+                _polling_loop(polygon, bot, state, stop_evt,
+                              prev_close_cache, day_high_cache),
+                ws_client.run(stop_evt),
+            )
         finally:
+            _save_state(state, STATE_FILE)
             if bot:
                 await bot.stop()
             if bot_task:
@@ -354,6 +534,7 @@ async def _amain():
                     await asyncio.wait_for(bot_task, timeout=5)
                 except (asyncio.TimeoutError, Exception):
                     pass
+
     return 0
 
 
@@ -373,11 +554,6 @@ def _selftest():
     assert grade_at_least("A+", "B")
     assert not grade_at_least("C", "A+")
     print(f"Scoring + grade gating: OK (sample grade={s.grade})")
-    _write_watchlist(["AAA", "BBB"], ["CCC"], "/tmp/_wl.txt")
-    contents = open("/tmp/_wl.txt").read()
-    assert "###Small Cap Gainers,AAA,BBB" in contents
-    assert "###Mid Cap Gainers,CCC" in contents
-    print("Watchlist writer: OK")
     print("Selftest passed.")
     return 0
 

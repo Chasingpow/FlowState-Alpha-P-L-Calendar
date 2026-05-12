@@ -84,12 +84,15 @@ class PolygonClient:
         self.api_key = api_key
         self.session = session
         self._details_cache = _TtlCache(60 * 60 * 24)   # 24h
-        self._avgvol_cache = _TtlCache(60 * 60 * 24)    # 24h
+        self._avgvol_cache = _TtlCache(60 * 60 * 24)    # 24h for hits
+        self._avgvol_neg_cache = _TtlCache(60 * 5)      # 5m for failures (retry after 5 min)
         self._avgvol3m_cache = _TtlCache(60 * 60 * 24)  # 24h
         self._news_cache = _TtlCache(60 * 5)            # 5m
+        # Cap concurrent aggs calls so a burst of new tickers doesn't trigger 429s
+        self._avgvol_sem = asyncio.Semaphore(5)
 
     async def _get(self, path: str, params: dict | None = None,
-                   retries: int = 3) -> dict:
+                   retries: int = 2) -> dict:
         params = dict(params or {})
         params["apiKey"] = self.api_key
         url = f"{BASE}{path}"
@@ -141,28 +144,33 @@ class PolygonClient:
 
     async def avg_volume_20d(self, symbol: str) -> Optional[float]:
         """Average daily volume over the last 20 trading days, cached daily."""
-        cached = self._avgvol_cache.get(symbol)
-        if cached is not None:
-            return cached
-        # Pull 30 calendar days of daily aggs to make sure we have ≥ 20 trading days
-        from datetime import datetime, timedelta, timezone
-        end = datetime.now(timezone.utc).date()
-        start = end - timedelta(days=40)
-        path = f"/v2/aggs/ticker/{symbol}/range/1/day/{start.isoformat()}/{end.isoformat()}"
-        try:
-            data = await self._get(path, {"adjusted": "true", "sort": "desc", "limit": 25})
-        except PolygonError:
-            return None
-        results = (data or {}).get("results") or []
-        if not results:
-            return None
-        # Skip today's bar if present (we want 20 *prior* days)
-        vols = [r.get("v") for r in results if r.get("v")][:20]
-        if not vols:
-            return None
-        avg = sum(vols) / len(vols)
-        self._avgvol_cache.set(symbol, avg)
-        return avg
+        if self._avgvol_cache.get(symbol) is not None:
+            return self._avgvol_cache.get(symbol)
+        if self._avgvol_neg_cache.get(symbol) is not None:
+            return None  # failed recently — retry in 5 min
+        async with self._avgvol_sem:
+            # Re-check after acquiring semaphore — another coroutine may have populated it
+            if self._avgvol_cache.get(symbol) is not None:
+                return self._avgvol_cache.get(symbol)
+            if self._avgvol_neg_cache.get(symbol) is not None:
+                return None
+            from datetime import datetime, timedelta, timezone
+            end = datetime.now(timezone.utc).date()
+            start = end - timedelta(days=40)
+            path = f"/v2/aggs/ticker/{symbol}/range/1/day/{start.isoformat()}/{end.isoformat()}"
+            try:
+                data = await self._get(path, {"adjusted": "true", "sort": "desc", "limit": 25})
+            except PolygonError:
+                self._avgvol_neg_cache.set(symbol, True)
+                return None
+            results = (data or {}).get("results") or []
+            vols = [r.get("v") for r in results if r.get("v")][:20]
+            if not vols:
+                self._avgvol_neg_cache.set(symbol, True)
+                return None
+            avg = sum(vols) / len(vols)
+            self._avgvol_cache.set(symbol, avg)
+            return avg
 
     async def avg_volume_3m(self, symbol: str) -> Optional[float]:
         """Average daily volume over the last ~65 trading days (3 months), cached daily."""
