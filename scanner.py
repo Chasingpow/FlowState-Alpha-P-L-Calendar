@@ -230,7 +230,7 @@ async def _process_candidate(
         (change_pct >=  30 and todays_volume >= max(cfg.volume_threshold * 4, 100_000))
     )
 
-    # Tiered alert rules (long_absence computed first so it can gate B/C re-alerts):
+    # Tiered alert rules for first alerts and long-absence re-entries:
     #   A / A+     — always alert
     #   B          — alert with news, OR re-entry after 2h+, OR 100%+ extreme mover
     #   C          — alert ONLY for 100%+ extreme movers that are already on our radar
@@ -247,7 +247,11 @@ async def _process_candidate(
             mega_move
         )
 
-    if qualifies and (is_first_alert or grade_improved or long_absence):
+    # Grade upgrades always fire when new grade is B or better — the improvement
+    # itself is the signal (C→B, B→A, etc.). Don't make the user scroll back 2h.
+    grade_upgrade_fires = grade_improved and grade_at_least(grade, "B")
+
+    if (qualifies or grade_upgrade_fires) and (is_first_alert or grade_improved or long_absence):
         if bot:
             payload = AlertPayload(
                 symbol=symbol,
