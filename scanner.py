@@ -74,6 +74,7 @@ GRADE_ORDER = ["F", "D", "C", "B", "A", "A+"]
 class TickerState:
     last_alert_grade: Optional[str]  = None
     last_alert_time:  float          = 0.0
+    last_alert_price: float          = 0.0
     last_followup_time: float        = 0.0
     last_high_of_day: float          = 0.0
     nhod_streak: int                 = 0
@@ -108,6 +109,7 @@ def _save_state(state: dict, path: str) -> None:
         data = {sym: {
             "last_alert_grade": st.last_alert_grade,
             "last_alert_time": st.last_alert_time,
+            "last_alert_price": st.last_alert_price,
             "last_followup_time": st.last_followup_time,
             "last_high_of_day": st.last_high_of_day,
             "nhod_streak": st.nhod_streak,
@@ -128,6 +130,7 @@ def _load_state(path: str) -> dict:
             st = TickerState(
                 last_alert_grade=d.get("last_alert_grade"),
                 last_alert_time=d.get("last_alert_time", 0.0),
+                last_alert_price=d.get("last_alert_price", 0.0),
                 last_followup_time=d.get("last_followup_time", 0.0),
                 last_high_of_day=d.get("last_high_of_day", 0.0),
                 nhod_streak=d.get("nhod_streak", 0),
@@ -227,18 +230,29 @@ async def _process_candidate(
     # mirrors the gainers-list behaviour that catches TDIC-type breakouts.
     mega_move = (
         (change_pct >= 100 and todays_volume >= cfg.volume_threshold) or
-        (change_pct >=  50 and todays_volume >= cfg.volume_threshold * 2) or
-        (change_pct >=  30 and todays_volume >= max(cfg.volume_threshold * 4, 100_000))
+        (change_pct >=  50 and todays_volume >= cfg.volume_threshold) or
+        (change_pct >=  30 and todays_volume >= max(cfg.volume_threshold * 2, 100_000))
+    )
+
+    # Price-appreciation re-alert: stock moved 20%+ from where we last alerted AND
+    # at least ALERT_COOLDOWN_SEC (default 30 min) has passed. Catches TDIC-type
+    # continuation moves where the grade hasn't changed but the price ripped again.
+    price_appreciation = (
+        not is_first_alert and
+        st.last_alert_price > 0 and
+        (last_price - st.last_alert_price) / st.last_alert_price >= 0.20 and
+        (now - st.last_alert_time) >= ALERT_COOLDOWN_SEC
     )
 
     # Tiered alert rules for first alerts and long-absence re-entries:
-    #   A / A+      — always alert
-    #   B           — alert with news, OR re-entry after 2h+, OR 100%+ extreme mover
-    #   C           — alert ONLY for 100%+ extreme movers that are already on our radar
-    #   mega_move   — bypass scoring: big % on real volume always qualifies
-    #   top_gainer  — ranked in top 20 gainers for its band → always qualifies first alert
-    #   Pre-market  — B or better (news lags gap opens by several minutes)
-    #   D / F       — never (unless mega_move or top_gainer)
+    #   A / A+            — always alert
+    #   B                 — alert with news, OR re-entry after 2h+, OR 100%+ extreme mover
+    #   C                 — alert ONLY for 100%+ extreme movers that are already on our radar
+    #   mega_move         — bypass scoring: big % on real volume always qualifies
+    #   top_gainer        — ranked in top 20 gainers for its band → always qualifies
+    #   price_appreciation — 20%+ from last alert price → always qualifies for re-alert
+    #   Pre-market        — B or better (news lags gap opens by several minutes)
+    #   D / F             — never (unless bypass conditions above)
     if pm_mode:
         qualifies = grade_at_least(grade, "B") or mega_move or top_gainer
     else:
@@ -247,14 +261,15 @@ async def _process_candidate(
             (grade == "B" and (s.catalyst or long_absence or extreme)) or
             (grade == "C" and extreme and long_absence) or
             mega_move or
-            top_gainer
+            top_gainer or
+            price_appreciation
         )
 
     # Grade upgrades always fire when new grade is B or better — the improvement
     # itself is the signal (C→B, B→A, etc.). Don't make the user scroll back 2h.
     grade_upgrade_fires = grade_improved and grade_at_least(grade, "B")
 
-    if (qualifies or grade_upgrade_fires) and (is_first_alert or grade_improved or long_absence):
+    if (qualifies or grade_upgrade_fires) and (is_first_alert or grade_improved or long_absence or price_appreciation):
         if bot:
             payload = AlertPayload(
                 symbol=symbol,
@@ -273,11 +288,13 @@ async def _process_candidate(
                 log.warning("Bot alert failed for %s: %s", symbol, e)
         st.last_alert_time = now
         st.last_alert_grade = grade
+        st.last_alert_price = last_price
         log.info("ALERT %s grade=%s price=%.2f chg=%+.2f%% rvol=%s news=%s%s",
                  symbol, grade, last_price, change_pct,
                  f"{s.rvol_value:.1f}x" if s.rvol_value else "-",
                  "Y" if news else "N",
-                 " [MEGA]" if mega_move else " [TOP]" if top_gainer else "")
+                 " [MEGA]" if mega_move else " [TOP]" if top_gainer
+                 else " [+PRICE]" if price_appreciation else "")
 
     if (st.last_alert_grade is not None and
             is_new_hod and
@@ -409,11 +426,11 @@ def _build_trade_handler(
             day_high_cache[sym] = new_high
 
         # Top-gainer bypass for WebSocket first prints: a stock we have never
-        # alerted that is up 10%+ with real confirmed volume should always fire,
-        # matching what the gainers list shows before the REST poll catches it.
+        # alerted that is up 10%+ fires immediately — % gain is the signal,
+        # no volume gate needed (thin mid-cap movers like TDIC get caught here).
         st_check = state.get(sym)
         never_alerted = st_check is None or st_check.last_alert_grade is None
-        ws_top_gainer = never_alerted and change_pct >= 10.0 and av >= cfg.volume_threshold
+        ws_top_gainer = never_alerted and change_pct >= 10.0
 
         try:
             loop = asyncio.get_running_loop()
@@ -461,6 +478,7 @@ async def _polling_loop(
                 st.nhod_streak = 0
                 st.last_alert_grade = None
                 st.last_alert_time = 0.0
+                st.last_alert_price = 0.0
                 st.last_followup_time = 0.0
             day_high_cache.clear()
             trade_vol_cache.clear()
