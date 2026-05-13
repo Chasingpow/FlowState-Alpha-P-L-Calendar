@@ -170,12 +170,18 @@ async def _process_candidate(
     is_premarket  = (4 * 60 <= now_mins < 9 * 60 + 30) and now_et.weekday() < 5
     is_afterhours = (16 * 60 <= now_mins <= 20 * 60)   and now_et.weekday() < 5
 
-    # Pre-market: volume=0 → regular session not open yet
-    pm_mode = todays_volume == 0 and change_pct > 0
+    # Use session time (not volume) so both REST (day.v=0) and WebSocket
+    # (av>0 from pre-market trades) get consistent relaxed scoring.
+    pm_mode = is_premarket and change_pct > 0
 
-    if pm_mode or (is_premarket and has_news):
-        # Pre-market catalyst: relax volume/RVOL; gap vs prev_close still required
-        todays_open = todays_open if todays_open is not None else last_price
+    if pm_mode:
+        # Polygon leaves day.o and day.h as 0 until the 9:30am open.
+        # Treat 0 as "unset" and substitute last_price so gap and technical
+        # checks are computed against something meaningful.
+        if not todays_open:
+            todays_open = last_price
+        if not todays_high:
+            todays_high = last_price
         score_cfg = ScoringConfig(
             volume_threshold=0,
             rvol_threshold=0.0,
@@ -189,7 +195,7 @@ async def _process_candidate(
             volume_threshold=0,
             rvol_threshold=0.0,
             gap_threshold_pct=0.0,
-            tech_proximity_pct=5.0,  # price just needs to be near the AH high
+            tech_proximity_pct=5.0,
         )
     else:
         score_cfg = cfg
@@ -210,8 +216,13 @@ async def _process_candidate(
 
     now = time.time()
     grade = s.grade
-    # A/A+ always alert; B only when a news catalyst is present; C and below suppressed
-    qualifies = grade_at_least(grade, "A") or (grade == "B" and s.catalyst)
+    if pm_mode:
+        # Pre-market: B or better qualifies — news confirmation often lags the
+        # gap by several minutes so we can't require it upfront.
+        qualifies = grade_at_least(grade, "B")
+    else:
+        # Regular session + after-hours: A/A+ always; B only with news catalyst
+        qualifies = grade_at_least(grade, "A") or (grade == "B" and s.catalyst)
     is_first_alert = st.last_alert_grade is None
     grade_improved = (not is_first_alert and
         GRADE_ORDER.index(grade) > GRADE_ORDER.index(st.last_alert_grade))
@@ -226,7 +237,7 @@ async def _process_candidate(
                 change_abs=change_abs, todays_volume=todays_volume,
                 avg_volume_20d=avg_vol, gap_pct=s.gap_value, score=s,
                 band_label=("SMALL CAP" if is_small_cap else "MID CAP")
-                           + (" · AH" if is_afterhours else " · PM" if (pm_mode or is_premarket) else ""),
+                           + (" · AH" if is_afterhours else " · PM" if pm_mode else ""),
                 band_range=f"${band[0]:g} - ${band[1]:g}",
                 is_small_cap=is_small_cap, details=details, news=news,
             )
