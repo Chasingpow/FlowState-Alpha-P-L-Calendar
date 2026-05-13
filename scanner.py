@@ -162,9 +162,19 @@ async def _process_candidate(
         polygon.ticker_details(symbol),
     )
 
-    # Pre-market: volume==0 means regular session hasn't opened.
+    has_news = news is not None
+
+    # Determine which market session we're in
+    now_et   = datetime.now(_ET)
+    now_mins = now_et.hour * 60 + now_et.minute
+    is_premarket  = (4 * 60 <= now_mins < 9 * 60 + 30) and now_et.weekday() < 5
+    is_afterhours = (16 * 60 <= now_mins <= 20 * 60)   and now_et.weekday() < 5
+
+    # Pre-market: volume=0 → regular session not open yet
     pm_mode = todays_volume == 0 and change_pct > 0
-    if pm_mode:
+
+    if pm_mode or (is_premarket and has_news):
+        # Pre-market catalyst: relax volume/RVOL; gap vs prev_close still required
         todays_open = todays_open if todays_open is not None else last_price
         score_cfg = ScoringConfig(
             volume_threshold=0,
@@ -172,11 +182,20 @@ async def _process_candidate(
             gap_threshold_pct=cfg.gap_threshold_pct,
             tech_proximity_pct=cfg.tech_proximity_pct,
         )
+    elif is_afterhours and has_news:
+        # After-hours catalyst play: AH volume is always thin so volume/RVOL/gap
+        # gates are meaningless. change_pct > MIN_GAIN_PCT already gates entry.
+        score_cfg = ScoringConfig(
+            volume_threshold=0,
+            rvol_threshold=0.0,
+            gap_threshold_pct=0.0,
+            tech_proximity_pct=5.0,  # price just needs to be near the AH high
+        )
     else:
         score_cfg = cfg
 
     s = score(
-        has_news=news is not None, todays_volume=todays_volume,
+        has_news=has_news, todays_volume=todays_volume,
         avg_volume_20d=avg_vol,
         todays_open=float(todays_open) if todays_open is not None else None,
         prev_close=float(prev_close) if prev_close is not None else None,
@@ -206,7 +225,8 @@ async def _process_candidate(
                 last_price=last_price, change_pct=change_pct,
                 change_abs=change_abs, todays_volume=todays_volume,
                 avg_volume_20d=avg_vol, gap_pct=s.gap_value, score=s,
-                band_label="SMALL CAP" if is_small_cap else "MID CAP",
+                band_label=("SMALL CAP" if is_small_cap else "MID CAP")
+                           + (" · AH" if is_afterhours else " · PM" if (pm_mode or is_premarket) else ""),
                 band_range=f"${band[0]:g} - ${band[1]:g}",
                 is_small_cap=is_small_cap, details=details, news=news,
             )
