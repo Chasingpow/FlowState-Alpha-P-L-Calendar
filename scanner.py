@@ -148,6 +148,7 @@ async def _process_candidate(
     *, symbol: str, last_price: float, change_pct: float, change_abs: float,
     todays_volume: int, todays_high: float, todays_open, prev_close,
     band, is_small_cap: bool, polygon, bot, state: dict, cfg,
+    top_gainer: bool = False,
 ) -> Optional[str]:
     if not symbol or "." in symbol:
         return None
@@ -231,20 +232,22 @@ async def _process_candidate(
     )
 
     # Tiered alert rules for first alerts and long-absence re-entries:
-    #   A / A+     — always alert
-    #   B          — alert with news, OR re-entry after 2h+, OR 100%+ extreme mover
-    #   C          — alert ONLY for 100%+ extreme movers that are already on our radar
-    #   mega_move  — bypass scoring: big % on real volume always qualifies
-    #   Pre-market — B or better (news lags gap opens by several minutes)
-    #   D / F      — never (unless mega_move)
+    #   A / A+      — always alert
+    #   B           — alert with news, OR re-entry after 2h+, OR 100%+ extreme mover
+    #   C           — alert ONLY for 100%+ extreme movers that are already on our radar
+    #   mega_move   — bypass scoring: big % on real volume always qualifies
+    #   top_gainer  — ranked in top 20 gainers for its band → always qualifies first alert
+    #   Pre-market  — B or better (news lags gap opens by several minutes)
+    #   D / F       — never (unless mega_move or top_gainer)
     if pm_mode:
-        qualifies = grade_at_least(grade, "B") or mega_move
+        qualifies = grade_at_least(grade, "B") or mega_move or top_gainer
     else:
         qualifies = (
             grade_at_least(grade, "A") or
             (grade == "B" and (s.catalyst or long_absence or extreme)) or
             (grade == "C" and extreme and long_absence) or
-            mega_move
+            mega_move or
+            top_gainer
         )
 
     # Grade upgrades always fire when new grade is B or better — the improvement
@@ -274,7 +277,7 @@ async def _process_candidate(
                  symbol, grade, last_price, change_pct,
                  f"{s.rvol_value:.1f}x" if s.rvol_value else "-",
                  "Y" if news else "N",
-                 " [MEGA]" if mega_move else "")
+                 " [MEGA]" if mega_move else " [TOP]" if top_gainer else "")
 
     if (st.last_alert_grade is not None and
             is_new_hod and
@@ -405,6 +408,13 @@ def _build_trade_handler(
         if new_high > current_high:
             day_high_cache[sym] = new_high
 
+        # Top-gainer bypass for WebSocket first prints: a stock we have never
+        # alerted that is up 10%+ with real confirmed volume should always fire,
+        # matching what the gainers list shows before the REST poll catches it.
+        st_check = state.get(sym)
+        never_alerted = st_check is None or st_check.last_alert_grade is None
+        ws_top_gainer = never_alerted and change_pct >= 10.0 and av >= cfg.volume_threshold
+
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -417,6 +427,7 @@ def _build_trade_handler(
                 todays_open=op, prev_close=prev_close,
                 band=band, is_small_cap=is_small_cap,
                 polygon=polygon, bot=bot, state=state, cfg=cfg,
+                top_gainer=ws_top_gainer,
             )
         )
 
@@ -495,6 +506,7 @@ async def _polling_loop(
 
             small_top, mid_top = [], []
             ps, pm = 0, 0
+            ps_rank, pm_rank = 0, 0  # per-band rank by % gain (1 = top gainer)
             for t in candidates:
                 last_trade = t.get("lastTrade") or {}
                 day  = t.get("day") or {}
@@ -514,26 +526,30 @@ async def _polling_loop(
                 already_alerted = _st is not None and _st.last_alert_time > 0
 
                 if in_band(price, SMALL_CAP_BAND) and (ps < TOP_N or already_alerted):
+                    ps_rank += 1
                     sym = await _process_candidate(
                         symbol=sym_key, last_price=price,
                         change_pct=chg_pct, change_abs=chg_abs,
                         todays_volume=t_volume, todays_high=t_high,
                         todays_open=t_open, prev_close=p_close,
                         band=SMALL_CAP_BAND, is_small_cap=True,
-                        polygon=polygon, bot=bot, state=state, cfg=_CFG_SMALL)
+                        polygon=polygon, bot=bot, state=state, cfg=_CFG_SMALL,
+                        top_gainer=(ps_rank <= 20))
                     if sym:
                         small_top.append(sym)
                         if not already_alerted:
                             ps += 1
 
                 if in_band(price, MID_CAP_BAND) and (pm < TOP_N or already_alerted):
+                    pm_rank += 1
                     sym = await _process_candidate(
                         symbol=sym_key, last_price=price,
                         change_pct=chg_pct, change_abs=chg_abs,
                         todays_volume=t_volume, todays_high=t_high,
                         todays_open=t_open, prev_close=p_close,
                         band=MID_CAP_BAND, is_small_cap=False,
-                        polygon=polygon, bot=bot, state=state, cfg=_CFG_MID)
+                        polygon=polygon, bot=bot, state=state, cfg=_CFG_MID,
+                        top_gainer=(pm_rank <= 20))
                     if sym:
                         mid_top.append(sym)
                         if not already_alerted:
