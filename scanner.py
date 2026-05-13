@@ -222,19 +222,29 @@ async def _process_candidate(
     long_absence = (not is_first_alert and (now - st.last_alert_time) >= 7200)
     extreme = change_pct >= 100  # stock is up 100%+ on the day
 
+    # Momentum bypass: massive % move on confirmed real volume — always alert,
+    # mirrors the gainers-list behaviour that catches TDIC-type breakouts.
+    mega_move = (
+        (change_pct >= 100 and todays_volume >= cfg.volume_threshold) or
+        (change_pct >=  50 and todays_volume >= cfg.volume_threshold * 2) or
+        (change_pct >=  30 and todays_volume >= max(cfg.volume_threshold * 4, 100_000))
+    )
+
     # Tiered alert rules (long_absence computed first so it can gate B/C re-alerts):
-    #   A / A+  — always alert
-    #   B       — alert with news, OR re-entry after 2h+, OR 100%+ extreme mover
-    #   C       — alert ONLY for 100%+ extreme movers that are already on our radar
+    #   A / A+     — always alert
+    #   B          — alert with news, OR re-entry after 2h+, OR 100%+ extreme mover
+    #   C          — alert ONLY for 100%+ extreme movers that are already on our radar
+    #   mega_move  — bypass scoring: big % on real volume always qualifies
     #   Pre-market — B or better (news lags gap opens by several minutes)
-    #   D / F   — never
+    #   D / F      — never (unless mega_move)
     if pm_mode:
-        qualifies = grade_at_least(grade, "B")
+        qualifies = grade_at_least(grade, "B") or mega_move
     else:
         qualifies = (
             grade_at_least(grade, "A") or
             (grade == "B" and (s.catalyst or long_absence or extreme)) or
-            (grade == "C" and extreme and long_absence)
+            (grade == "C" and extreme and long_absence) or
+            mega_move
         )
 
     if qualifies and (is_first_alert or grade_improved or long_absence):
@@ -256,10 +266,11 @@ async def _process_candidate(
                 log.warning("Bot alert failed for %s: %s", symbol, e)
         st.last_alert_time = now
         st.last_alert_grade = grade
-        log.info("ALERT %s grade=%s price=%.2f chg=%+.2f%% rvol=%s news=%s",
+        log.info("ALERT %s grade=%s price=%.2f chg=%+.2f%% rvol=%s news=%s%s",
                  symbol, grade, last_price, change_pct,
                  f"{s.rvol_value:.1f}x" if s.rvol_value else "-",
-                 "Y" if news else "N")
+                 "Y" if news else "N",
+                 " [MEGA]" if mega_move else "")
 
     if (st.last_alert_grade is not None and
             is_new_hod and

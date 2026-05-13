@@ -343,8 +343,10 @@ class ScannerBot:
         ch = await self._channel(target_id)
         if not ch:
             return None
-        embed = (build_compact_embed(payload) if payload.score.grade == "C"
-                 else build_embed(payload))
+        # Use the full embed for high-momentum C alerts (30%+) so they don't
+        # get buried as one-liners when the stock is actually ripping hard.
+        use_full = payload.score.grade != "C" or payload.change_pct >= 30
+        embed = build_embed(payload) if use_full else build_compact_embed(payload)
         try:
             msg = await ch.send(embed=embed)
         except discord.HTTPException as e:
