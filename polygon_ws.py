@@ -27,9 +27,11 @@ WS_URL = "wss://socket.polygon.io/stocks"
 
 
 class PolygonWSClient:
-    def __init__(self, api_key: str, on_bar: Callable[[dict], Any]):
+    def __init__(self, api_key: str, on_bar: Callable[[dict], Any],
+                 on_trade: Callable[[dict], Any] | None = None):
         self.api_key = api_key
-        self.on_bar = on_bar  # sync callback — called per A event
+        self.on_bar = on_bar      # sync callback — called per A (second-bar) event
+        self.on_trade = on_trade  # sync callback — called per T (individual trade) event
 
     async def run(self, stop_evt: asyncio.Event) -> None:
         """Connect, authenticate, subscribe, and stream events. Reconnects on error."""
@@ -56,7 +58,11 @@ class PolygonWSClient:
             async with session.ws_connect(WS_URL, heartbeat=20) as ws:
                 log.info("WebSocket connected — authenticating...")
                 await ws.send_str(json.dumps({"action": "auth", "params": self.api_key}))
-                await ws.send_str(json.dumps({"action": "subscribe", "params": "A.*"}))
+                # Subscribe to individual trades (T.*) for first-print detection
+                # AND per-second bars (A.*) for accurate accumulated volume + day high.
+                subs = "T.*,A.*" if self.on_trade else "A.*"
+                await ws.send_str(json.dumps({"action": "subscribe", "params": subs}))
+                log.info("Subscribed to %s", subs)
 
                 async for msg in ws:
                     if stop_evt.is_set():
@@ -69,7 +75,9 @@ class PolygonWSClient:
                             continue
                         for ev in events:
                             ev_type = ev.get("ev")
-                            if ev_type == "A":
+                            if ev_type == "T" and self.on_trade:
+                                self.on_trade(ev)
+                            elif ev_type == "A":
                                 self.on_bar(ev)
                             elif ev_type in ("connected", "auth_success", "auth_failed",
                                              "success", "error"):

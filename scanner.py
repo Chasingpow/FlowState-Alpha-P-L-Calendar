@@ -282,26 +282,70 @@ async def _warm_caches(polygon, symbols: list) -> None:
 
 
 def _build_ws_handler(
-    polygon, bot, state: dict,
     prev_close_cache: dict, day_high_cache: dict,
+    trade_vol_cache: dict, day_open_cache: dict,
 ) -> callable:
-    """Return a sync on_bar callback that schedules _process_candidate tasks.
+    """A.* handler — maintains caches only. Task creation is the T.* handler's job.
 
-    prev_close_cache and day_high_cache are seeded + updated by the REST loop.
-    The WebSocket handler updates day_high_cache incrementally from A events.
+    A events provide authoritative accumulated volume (av), the official open
+    price (op), and per-second highs — none of which are in T events.
     """
     def on_bar(ev: dict) -> None:
         sym = ev.get("sym", "")
         if not sym or "." in sym:
             return
 
-        price = float(ev.get("c") or 0.0)
+        # Official open price — set once the session opens; use as day_open_cache
+        op = ev.get("op")
+        if op:
+            day_open_cache[sym] = float(op)
+
+        # Polygon's authoritative accumulated volume beats our T-size sum
+        av = int(ev.get("av") or 0)
+        if av > trade_vol_cache.get(sym, 0):
+            trade_vol_cache[sym] = av
+
+        # Day high — T events only carry per-trade price, not the running day high
+        bar_high = float(ev.get("h") or 0.0)
+        price    = float(ev.get("c") or 0.0)
+        new_high = max(bar_high, day_high_cache.get(sym, 0.0), price)
+        if new_high > day_high_cache.get(sym, 0.0):
+            day_high_cache[sym] = new_high
+
+    return on_bar
+
+
+def _build_trade_handler(
+    polygon, bot, state: dict,
+    prev_close_cache: dict, day_high_cache: dict,
+    trade_vol_cache: dict, day_open_cache: dict,
+) -> callable:
+    """T.* handler — fires _process_candidate on the first qualifying print.
+
+    T events arrive the moment a trade executes, giving sub-second gap detection.
+    A 5-second per-ticker task debounce prevents flooding the event loop when
+    an active stock prints hundreds of trades per second.
+    """
+    _task_times: dict[str, float] = {}  # sym → last time we created a task
+
+    def on_trade(ev: dict) -> None:
+        sym = ev.get("sym", "")
+        if not sym or "." in sym:
+            return
+
+        price = float(ev.get("p") or 0.0)
         if price <= 0:
             return
 
+        # Accumulate this trade's size into our running day-volume tally.
+        # The A.* handler will correct this with Polygon's authoritative av later.
+        trade_size = int(ev.get("s") or 0)
+        if trade_size > 0:
+            trade_vol_cache[sym] = trade_vol_cache.get(sym, 0) + trade_size
+
         prev_close = prev_close_cache.get(sym)
         if not prev_close or prev_close <= 0:
-            return  # no reference price yet — wait for REST poll to seed it
+            return
 
         change_pct = (price - prev_close) / prev_close * 100.0
         if change_pct < MIN_GAIN_PCT or change_pct > 1000:
@@ -314,22 +358,28 @@ def _build_ws_handler(
         else:
             return
 
-        # Debounce: skip if we alerted this ticker within the last 30s.
-        # First-ever alerts always pass (last_alert_time is 0.0 = falsy).
+        # Alert debounce: don't re-alert a ticker we alerted in the last 60s.
+        # First-ever alerts (last_alert_time == 0.0) always pass immediately.
         st = state.get(sym)
-        if st and st.last_alert_time and (time.time() - st.last_alert_time) < 30:
+        if st and st.last_alert_time and (time.time() - st.last_alert_time) < 60:
             return
 
-        # ev.h is the high for this *second*, not the day. Maintain day high ourselves.
-        bar_high = float(ev.get("h") or price)
-        current_day_high = day_high_cache.get(sym, 0.0)
-        new_day_high = max(bar_high, current_day_high, price)
-        if new_day_high > current_day_high:
-            day_high_cache[sym] = new_day_high
+        # Task debounce: active stocks print hundreds of times per second.
+        # Cap task creation to once per 5s per ticker to keep the loop healthy.
+        now = time.time()
+        if now - _task_times.get(sym, 0) < 5:
+            return
+        _task_times[sym] = now
 
         change_abs = price - prev_close
-        av = int(ev.get("av") or 0)
-        op = ev.get("op")  # official open for the day (may be None pre-market)
+        av         = trade_vol_cache.get(sym, 0)
+        op         = day_open_cache.get(sym)  # None pre-market until A event arrives
+
+        # Update day high with this trade price
+        current_high = day_high_cache.get(sym, 0.0)
+        new_high = max(current_high, price)
+        if new_high > current_high:
+            day_high_cache[sym] = new_high
 
         try:
             loop = asyncio.get_running_loop()
@@ -339,19 +389,20 @@ def _build_ws_handler(
             _process_candidate(
                 symbol=sym, last_price=price,
                 change_pct=change_pct, change_abs=change_abs,
-                todays_volume=av, todays_high=new_day_high,
+                todays_volume=av, todays_high=new_high,
                 todays_open=op, prev_close=prev_close,
                 band=band, is_small_cap=is_small_cap,
                 polygon=polygon, bot=bot, state=state, cfg=cfg,
             )
         )
 
-    return on_bar
+    return on_trade
 
 
 async def _polling_loop(
     polygon, bot, state, stop_evt,
     prev_close_cache: dict, day_high_cache: dict,
+    trade_vol_cache: dict, day_open_cache: dict,
 ):
     """REST snapshot loop — refreshes caches and acts as WebSocket fallback."""
     consecutive_errors = 0
@@ -377,6 +428,8 @@ async def _polling_loop(
                 st.last_alert_time = 0.0
                 st.last_followup_time = 0.0
             day_high_cache.clear()
+            trade_vol_cache.clear()
+            day_open_cache.clear()
             log.info("New session %s — intraday state cleared.", today)
 
         loop_start = time.time()
@@ -393,10 +446,16 @@ async def _polling_loop(
                 prev = t.get("prevDay") or {}
                 pc = prev.get("c")
                 dh = day.get("h")
+                do = day.get("o")
+                dv = day.get("v")
                 if pc:
                     prev_close_cache[sym] = float(pc)
                 if dh and float(dh) > day_high_cache.get(sym, 0.0):
                     day_high_cache[sym] = float(dh)
+                if do:
+                    day_open_cache[sym] = float(do)
+                if dv and int(dv) > trade_vol_cache.get(sym, 0):
+                    trade_vol_cache[sym] = int(dv)
 
             candidates = [t for t in tickers
                           if (t.get("todaysChangePerc") or 0) >= MIN_GAIN_PCT]
@@ -515,16 +574,21 @@ async def _amain():
         log.warning("Discord disabled: set DISCORD_BOT_TOKEN, CHANNEL_SMALL, "
                     "CHANNEL_MID to enable.")
 
-    # Shared caches: seeded by initial REST snapshot, kept fresh by polling loop,
-    # and read (not written) by the WebSocket handler per-event.
+    # Shared caches — seeded at startup from REST snapshot, then kept fresh by:
+    #   prev_close_cache : REST poll (prevDay.c) and A.* events (op)
+    #   day_high_cache   : REST poll (day.h) and A.* events (bar high)
+    #   trade_vol_cache  : T.* events (size accumulation) + A.* (authoritative av)
+    #   day_open_cache   : REST poll (day.o) + A.* events (op field)
     prev_close_cache: dict[str, float] = {}
     day_high_cache:   dict[str, float] = {}
+    trade_vol_cache:  dict[str, int]   = {}
+    day_open_cache:   dict[str, float] = {}
 
     async with aiohttp.ClientSession() as session:
         polygon = PolygonClient(POLYGON_API_KEY, session)
 
-        # Initial snapshot seeds prev_close + day_high before WebSocket connects
-        # so the WS handler has reference prices from the very first event.
+        # Seed all four caches before WebSocket connects so T.* events have
+        # prev_close reference prices from the very first trade.
         try:
             log.info("Seeding caches from initial REST snapshot...")
             init_tickers = await polygon.snapshot_all_us()
@@ -536,24 +600,34 @@ async def _amain():
                 prev = t.get("prevDay") or {}
                 pc = prev.get("c")
                 dh = day.get("h")
+                do = day.get("o")
+                dv = day.get("v")
                 if pc:
                     prev_close_cache[sym] = float(pc)
                 if dh:
                     day_high_cache[sym] = float(dh)
-            log.info("Seeded %d prev_close / %d day_high entries",
-                     len(prev_close_cache), len(day_high_cache))
+                if do:
+                    day_open_cache[sym] = float(do)
+                if dv:
+                    trade_vol_cache[sym] = int(dv)
+            log.info("Seeded %d tickers into caches", len(prev_close_cache))
         except Exception as e:
             log.warning("Initial snapshot seeding failed: %s — WS will warm up gradually", e)
 
-        ws_handler = _build_ws_handler(
-            polygon, bot, state, prev_close_cache, day_high_cache,
+        bar_handler   = _build_ws_handler(
+            prev_close_cache, day_high_cache, trade_vol_cache, day_open_cache,
         )
-        ws_client = PolygonWSClient(POLYGON_API_KEY, ws_handler)
+        trade_handler = _build_trade_handler(
+            polygon, bot, state,
+            prev_close_cache, day_high_cache, trade_vol_cache, day_open_cache,
+        )
+        ws_client = PolygonWSClient(POLYGON_API_KEY, bar_handler, trade_handler)
 
         try:
             await asyncio.gather(
                 _polling_loop(polygon, bot, state, stop_evt,
-                              prev_close_cache, day_high_cache),
+                              prev_close_cache, day_high_cache,
+                              trade_vol_cache, day_open_cache),
                 ws_client.run(stop_evt),
             )
         finally:
