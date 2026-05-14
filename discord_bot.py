@@ -138,12 +138,14 @@ def build_embed(p: AlertPayload) -> discord.Embed:
 
     # Stats column 2
     d = p.details
-    float_str = _fmt_compact(d.shares_outstanding) if d else "—"
+    shares = d.shares_outstanding if d else None
+    float_str = _fmt_compact(shares) if shares else "—"
+    low_float_tag = " 🔸LOW FLOAT" if shares and shares < 20_000_000 else ""
     mktcap_str = f"${_fmt_compact(d.market_cap)}" if d and d.market_cap else "—"
     exch_str = (d.primary_exchange or "—") if d else "—"
     country_str = _country_flag(d.locale if d else None)
     stats2 = (
-        f"Float: **{float_str}**\n"
+        f"Float: **{float_str}**{low_float_tag}\n"
         f"Mkt Cap: **{mktcap_str}**\n"
         f"Exchange: **{exch_str}**\n"
         f"Country: **{country_str}**"
@@ -343,9 +345,10 @@ class ScannerBot:
         ch = await self._channel(target_id)
         if not ch:
             return None
-        # Use the full embed for high-momentum C alerts (30%+) so they don't
-        # get buried as one-liners when the stock is actually ripping hard.
-        use_full = payload.score.grade != "C" or payload.change_pct >= 30
+        # Full embed for: B+, 30%+ moves, or any signal-tagged alert (NHOD, GAPGO, POP, CONT)
+        _signal_tags = ("NHOD", "GAPGO", "POP", "CONT", "LOW FLOAT", "MEGA", "TOP20")
+        has_signal = any(tag in payload.band_label for tag in _signal_tags)
+        use_full = payload.score.grade != "C" or payload.change_pct >= 30 or has_signal
         embed = build_embed(payload) if use_full else build_compact_embed(payload)
         try:
             msg = await ch.send(embed=embed)

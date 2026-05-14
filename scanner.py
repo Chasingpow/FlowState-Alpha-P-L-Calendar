@@ -49,6 +49,7 @@ BOT_DISPLAY_NAME    = os.getenv("BOT_DISPLAY_NAME", "").strip() or None
 # REST polling is now a background refresh; WebSocket handles real-time detection.
 POLL_INTERVAL_SEC   = float(os.getenv("POLL_INTERVAL_SEC", "30.0"))
 ALERT_COOLDOWN_SEC  = float(os.getenv("ALERT_COOLDOWN_SEC", "1800"))
+NHOD_COOLDOWN_SEC   = float(os.getenv("NHOD_COOLDOWN_SEC", "120"))   # 2 min between NHOD re-alerts
 FOLLOWUP_INTERVAL_SEC = float(os.getenv("FOLLOWUP_INTERVAL_SEC", "300"))
 ALERT_MIN_GRADE     = os.getenv("ALERT_MIN_GRADE", "A").strip()
 TOP_N               = int(os.getenv("TOP_N", "40"))
@@ -282,6 +283,28 @@ async def _process_candidate(
         (now - st.last_alert_time) >= ALERT_COOLDOWN_SEC
     )
 
+    # Signal type — shown in the embed title so traders know WHY it fired
+    low_float = bool(details and details.shares_outstanding
+                     and details.shares_outstanding < 20_000_000)
+    if price_appreciation:
+        signal = "CONT"
+    elif top_gainer_refire and is_new_hod:
+        signal = "NHOD"
+    elif top_gainer_refire:
+        signal = "TOP20"
+    elif is_first_alert and s.gap_ok and change_pct >= 5:
+        signal = "GAPGO"
+    elif mega_move or (top_gainer and is_first_alert):
+        signal = "POP"
+    else:
+        signal = ""
+
+    def _band_label(sig: str) -> str:
+        base = ("SMALL CAP" if is_small_cap else "MID CAP")
+        base += " · AH" if is_afterhours else " · PM" if pm_mode else ""
+        tags = ([sig] if sig else []) + (["LOW FLOAT"] if low_float else [])
+        return base + (" · " + " · ".join(tags) if tags else "")
+
     fires = (is_first_alert or grade_improved or long_absence or
              price_appreciation or top_gainer_refire)
     if (qualifies or grade_upgrade_fires) and fires:
@@ -292,8 +315,7 @@ async def _process_candidate(
                 last_price=last_price, change_pct=change_pct,
                 change_abs=change_abs, todays_volume=todays_volume,
                 avg_volume_20d=avg_vol, gap_pct=s.gap_value, score=s,
-                band_label=("SMALL CAP" if is_small_cap else "MID CAP")
-                           + (" · AH" if is_afterhours else " · PM" if pm_mode else ""),
+                band_label=_band_label(signal),
                 band_range=f"${band[0]:g} - ${band[1]:g}",
                 is_small_cap=is_small_cap, details=details, news=news,
             )
@@ -304,28 +326,40 @@ async def _process_candidate(
         st.last_alert_time = now
         st.last_alert_grade = grade
         st.last_alert_price = last_price
-        log.info("ALERT %s grade=%s price=%.2f chg=%+.2f%% rvol=%s news=%s%s",
+        log.info("ALERT %s grade=%s price=%.2f chg=%+.2f%% rvol=%s news=%s sig=%s%s",
                  symbol, grade, last_price, change_pct,
                  f"{s.rvol_value:.1f}x" if s.rvol_value else "-",
-                 "Y" if news else "N",
-                 " [MEGA]" if mega_move else
-                 " [TOP-REFIRE]" if top_gainer_refire else
-                 " [TOP]" if top_gainer else
-                 " [+PRICE]" if price_appreciation else "")
+                 "Y" if news else "N", signal or "-",
+                 " LOW-FLOAT" if low_float else "")
 
-    if (st.last_alert_grade is not None and
-            is_new_hod and
-            (now - st.last_followup_time) >= FOLLOWUP_INTERVAL_SEC and
-            (now - st.last_alert_time) >= FOLLOWUP_INTERVAL_SEC):
+    # NHOD re-alert: stock made a new intraday high — fire a full embed alert
+    # (not a text line) every NHOD_COOLDOWN_SEC. This mirrors Momentum Pro's
+    # behaviour of re-alerting the same ticker each time it breaks to new highs.
+    if (is_new_hod and
+            st.last_alert_grade is not None and
+            (now - st.last_followup_time) >= NHOD_COOLDOWN_SEC and
+            (now - st.last_alert_time) >= NHOD_COOLDOWN_SEC):
         if bot:
+            nhod_payload = AlertPayload(
+                symbol=symbol,
+                company_name=(details.name if details else symbol),
+                last_price=last_price, change_pct=change_pct,
+                change_abs=change_abs, todays_volume=todays_volume,
+                avg_volume_20d=avg_vol, gap_pct=s.gap_value, score=s,
+                band_label=_band_label("NHOD"),
+                band_range=f"${band[0]:g} - ${band[1]:g}",
+                is_small_cap=is_small_cap, details=details, news=news,
+            )
             try:
-                await bot.send_followup(symbol=symbol, change_pct=change_pct,
-                                        streak=st.nhod_streak,
-                                        is_nhod=is_new_hod,
-                                        is_small_cap=is_small_cap)
+                await bot.send_alert(nhod_payload)
             except Exception as e:
-                log.warning("Bot followup failed for %s: %s", symbol, e)
+                log.warning("Bot NHOD alert failed for %s: %s", symbol, e)
         st.last_followup_time = now
+        st.last_alert_time = now
+        st.last_alert_price = last_price
+        log.info("NHOD %s price=%.2f chg=%+.2f%% streak=%d%s",
+                 symbol, last_price, change_pct, st.nhod_streak,
+                 " LOW-FLOAT" if low_float else "")
 
     return symbol
 
