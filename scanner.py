@@ -20,12 +20,12 @@ _ET = ZoneInfo("America/New_York")
 
 
 def _is_trading_session() -> bool:
-    """True Mon–Fri 4:00 AM – 8:00 PM ET (covers premarket, regular, after-hours)."""
+    """True Mon–Fri 3:30 AM – 8:00 PM ET (includes early pre-market activity)."""
     now = datetime.now(_ET)
     if now.weekday() >= 5:
         return False
     mins = now.hour * 60 + now.minute
-    return 4 * 60 <= mins <= 20 * 60
+    return 3 * 60 + 30 <= mins <= 20 * 60
 
 
 try:
@@ -138,6 +138,13 @@ def _load_state(path: str) -> dict:
             if st.last_alert_time:
                 alert_date = date.fromtimestamp(st.last_alert_time)
                 if alert_date < today:
+                    # Full daily reset — WebSocket fires before the polling loop's
+                    # in-memory reset runs, so state loaded from yesterday must be
+                    # clean or yesterday's alerted tickers look like "already alerted today".
+                    st.last_alert_grade = None
+                    st.last_alert_time = 0.0
+                    st.last_alert_price = 0.0
+                    st.last_followup_time = 0.0
                     st.last_high_of_day = 0.0
                     st.nhod_streak = 0
             state[sym] = st
@@ -171,7 +178,7 @@ async def _process_candidate(
     # Determine which market session we're in
     now_et   = datetime.now(_ET)
     now_mins = now_et.hour * 60 + now_et.minute
-    is_premarket  = (4 * 60 <= now_mins < 9 * 60 + 30) and now_et.weekday() < 5
+    is_premarket  = (3 * 60 + 30 <= now_mins < 9 * 60 + 30) and now_et.weekday() < 5
     is_afterhours = (16 * 60 <= now_mins <= 20 * 60)   and now_et.weekday() < 5
 
     # Use session time (not volume) so both REST (day.v=0) and WebSocket
@@ -244,10 +251,10 @@ async def _process_candidate(
         (now - st.last_alert_time) >= ALERT_COOLDOWN_SEC
     )
 
-    # Tiered alert rules for first alerts and long-absence re-entries:
+    # Tiered alert rules for first alerts and re-entries:
     #   A / A+            — always alert
     #   B                 — alert with news, OR re-entry after 2h+, OR 100%+ extreme mover
-    #   C                 — alert ONLY for 100%+ extreme movers that are already on our radar
+    #   C                 — after 2h absence, OR 100%+ extreme mover
     #   mega_move         — bypass scoring: big % on real volume always qualifies
     #   top_gainer        — ranked in top 20 gainers for its band → always qualifies
     #   price_appreciation — 20%+ from last alert price → always qualifies for re-alert
@@ -259,17 +266,25 @@ async def _process_candidate(
         qualifies = (
             grade_at_least(grade, "A") or
             (grade == "B" and (s.catalyst or long_absence or extreme)) or
-            (grade == "C" and extreme and long_absence) or
+            (grade == "C" and (extreme or long_absence)) or   # C qualifies after 2h absence
             mega_move or
             top_gainer or
             price_appreciation
         )
 
-    # Grade upgrades always fire when new grade is B or better — the improvement
-    # itself is the signal (C→B, B→A, etc.). Don't make the user scroll back 2h.
+    # Grade upgrades always fire when new grade is B or better.
     grade_upgrade_fires = grade_improved and grade_at_least(grade, "B")
 
-    if (qualifies or grade_upgrade_fires) and (is_first_alert or grade_improved or long_absence or price_appreciation):
+    # Top-20 gainer re-alert: if still in top 20 and ALERT_COOLDOWN_SEC has passed,
+    # re-alert regardless of grade. This is the "gainers list = scanner" guarantee.
+    top_gainer_refire = (
+        top_gainer and not is_first_alert and
+        (now - st.last_alert_time) >= ALERT_COOLDOWN_SEC
+    )
+
+    fires = (is_first_alert or grade_improved or long_absence or
+             price_appreciation or top_gainer_refire)
+    if (qualifies or grade_upgrade_fires) and fires:
         if bot:
             payload = AlertPayload(
                 symbol=symbol,
@@ -293,8 +308,10 @@ async def _process_candidate(
                  symbol, grade, last_price, change_pct,
                  f"{s.rvol_value:.1f}x" if s.rvol_value else "-",
                  "Y" if news else "N",
-                 " [MEGA]" if mega_move else " [TOP]" if top_gainer
-                 else " [+PRICE]" if price_appreciation else "")
+                 " [MEGA]" if mega_move else
+                 " [TOP-REFIRE]" if top_gainer_refire else
+                 " [TOP]" if top_gainer else
+                 " [+PRICE]" if price_appreciation else "")
 
     if (st.last_alert_grade is not None and
             is_new_hod and
