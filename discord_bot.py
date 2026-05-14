@@ -38,6 +38,7 @@ import discord
 
 import tts as tts_mod
 from polygon_client import NewsItem, TickerDetails
+from quiver_client import QuiverSignal
 from scoring import ScoreResult
 
 log = logging.getLogger("bot")
@@ -69,6 +70,7 @@ class AlertPayload:
     is_small_cap: bool
     details: Optional[TickerDetails]
     news: Optional[NewsItem]
+    quiver_signal: Optional[QuiverSignal] = None
 
 
 # --- Formatting helpers -----------------------------------------------------
@@ -119,6 +121,8 @@ def build_embed(p: AlertPayload) -> discord.Embed:
             f"\n📰 **News:** {p.news.title}\n"
             f"_{p.news.publisher} · {p.news.published_utc[:16].replace('T', ' ')} UTC_"
         )
+    if p.quiver_signal and p.quiver_signal.has_signal:
+        desc_lines.append(f"\n{p.quiver_signal.summary()}")
     embed = discord.Embed(
         title=title,
         description="\n".join(desc_lines),
@@ -346,8 +350,10 @@ class ScannerBot:
         if not ch:
             return None
         # Full embed for: B+, 30%+ moves, or any signal-tagged alert (NHOD, GAPGO, POP, CONT)
-        _signal_tags = ("NHOD", "GAPGO", "POP", "CONT", "LOW FLOAT", "MEGA", "TOP20")
-        has_signal = any(tag in payload.band_label for tag in _signal_tags)
+        _signal_tags = ("NHOD", "GAPGO", "POP", "CONT", "LOW FLOAT",
+                        "MEGA", "TOP20", "CONGRESS", "CONTRACT")
+        has_signal = (any(tag in payload.band_label for tag in _signal_tags)
+                      or (payload.quiver_signal and payload.quiver_signal.has_signal))
         use_full = payload.score.grade != "C" or payload.change_pct >= 30 or has_signal
         embed = build_embed(payload) if use_full else build_compact_embed(payload)
         try:

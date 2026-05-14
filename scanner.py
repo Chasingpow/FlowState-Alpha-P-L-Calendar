@@ -35,10 +35,12 @@ except Exception:
 
 from polygon_client import PolygonClient, PolygonError
 from polygon_ws import PolygonWSClient
+from quiver_client import QuiverClient, QuiverSignal
 from scoring import ScoringConfig, score
 from discord_bot import AlertPayload, ScannerBot
 
 POLYGON_API_KEY     = os.getenv("POLYGON_API_KEY", "").strip()
+QUIVER_API_KEY      = os.getenv("QUIVER_API_KEY", "").strip()
 DISCORD_BOT_TOKEN   = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 CHANNEL_SMALL       = int(os.getenv("CHANNEL_SMALL") or "0")
 CHANNEL_MID         = int(os.getenv("CHANNEL_MID") or "0")
@@ -155,11 +157,15 @@ def _load_state(path: str) -> dict:
         return {}
 
 
+async def _noop_signal():
+    return None
+
+
 async def _process_candidate(
     *, symbol: str, last_price: float, change_pct: float, change_abs: float,
     todays_volume: int, todays_high: float, todays_open, prev_close,
     band, is_small_cap: bool, polygon, bot, state: dict, cfg,
-    top_gainer: bool = False,
+    top_gainer: bool = False, quiver=None,
 ) -> Optional[str]:
     if not symbol or "." in symbol:
         return None
@@ -168,13 +174,17 @@ async def _process_candidate(
     if change_pct < MIN_GAIN_PCT or change_pct > 1000:
         return None
 
-    avg_vol, news, details = await asyncio.gather(
+    avg_vol, news, details, quiver_signal = await asyncio.gather(
         polygon.avg_volume_20d(symbol),
         polygon.latest_news(symbol, hours=24),
         polygon.ticker_details(symbol),
+        quiver.check_signals(symbol) if quiver else _noop_signal(),
     )
 
-    has_news = news is not None
+    # Quiver signals (congress buy, gov contract) count as catalysts for scoring
+    has_news = news is not None or (
+        quiver_signal is not None and quiver_signal.has_signal
+    )
 
     # Determine which market session we're in
     now_et   = datetime.now(_ET)
@@ -299,6 +309,12 @@ async def _process_candidate(
     else:
         signal = ""
 
+    # Quiver-specific signal tags override/supplement the base signal
+    if quiver_signal and quiver_signal.congress_buy:
+        signal = "CONGRESS" if not signal else signal + " · CONGRESS"
+    elif quiver_signal and quiver_signal.gov_contract:
+        signal = "CONTRACT" if not signal else signal + " · CONTRACT"
+
     def _band_label(sig: str) -> str:
         base = ("SMALL CAP" if is_small_cap else "MID CAP")
         base += " · AH" if is_afterhours else " · PM" if pm_mode else ""
@@ -318,6 +334,7 @@ async def _process_candidate(
                 band_label=_band_label(signal),
                 band_range=f"${band[0]:g} - ${band[1]:g}",
                 is_small_cap=is_small_cap, details=details, news=news,
+                quiver_signal=quiver_signal,
             )
             try:
                 await bot.send_alert(payload)
@@ -349,6 +366,7 @@ async def _process_candidate(
                 band_label=_band_label("NHOD"),
                 band_range=f"${band[0]:g} - ${band[1]:g}",
                 is_small_cap=is_small_cap, details=details, news=news,
+                quiver_signal=quiver_signal,
             )
             try:
                 await bot.send_alert(nhod_payload)
@@ -414,6 +432,7 @@ def _build_trade_handler(
     polygon, bot, state: dict,
     prev_close_cache: dict, day_high_cache: dict,
     trade_vol_cache: dict, day_open_cache: dict,
+    quiver=None,
 ) -> callable:
     """T.* handler — fires _process_candidate on the first qualifying print.
 
@@ -495,7 +514,7 @@ def _build_trade_handler(
                 todays_open=op, prev_close=prev_close,
                 band=band, is_small_cap=is_small_cap,
                 polygon=polygon, bot=bot, state=state, cfg=cfg,
-                top_gainer=ws_top_gainer,
+                top_gainer=ws_top_gainer, quiver=quiver,
             )
         )
 
@@ -506,6 +525,7 @@ async def _polling_loop(
     polygon, bot, state, stop_evt,
     prev_close_cache: dict, day_high_cache: dict,
     trade_vol_cache: dict, day_open_cache: dict,
+    quiver=None,
 ):
     """REST snapshot loop — refreshes caches and acts as WebSocket fallback."""
     consecutive_errors = 0
@@ -603,7 +623,7 @@ async def _polling_loop(
                         todays_open=t_open, prev_close=p_close,
                         band=SMALL_CAP_BAND, is_small_cap=True,
                         polygon=polygon, bot=bot, state=state, cfg=_CFG_SMALL,
-                        top_gainer=(ps_rank <= 20))
+                        top_gainer=(ps_rank <= 20), quiver=quiver)
                     if sym:
                         small_top.append(sym)
                         if not already_alerted:
@@ -618,7 +638,7 @@ async def _polling_loop(
                         todays_open=t_open, prev_close=p_close,
                         band=MID_CAP_BAND, is_small_cap=False,
                         polygon=polygon, bot=bot, state=state, cfg=_CFG_MID,
-                        top_gainer=(pm_rank <= 20))
+                        top_gainer=(pm_rank <= 20), quiver=quiver)
                     if sym:
                         mid_top.append(sym)
                         if not already_alerted:
@@ -723,12 +743,19 @@ async def _amain():
         except Exception as e:
             log.warning("Initial snapshot seeding failed: %s — WS will warm up gradually", e)
 
+        quiver = QuiverClient(QUIVER_API_KEY, session) if QUIVER_API_KEY else None
+        if quiver:
+            log.info("Quiver Quantitative signals enabled.")
+        else:
+            log.info("Quiver disabled — set QUIVER_API_KEY to enable congress/contract signals.")
+
         bar_handler   = _build_ws_handler(
             prev_close_cache, day_high_cache, trade_vol_cache, day_open_cache,
         )
         trade_handler = _build_trade_handler(
             polygon, bot, state,
             prev_close_cache, day_high_cache, trade_vol_cache, day_open_cache,
+            quiver=quiver,
         )
         ws_client = PolygonWSClient(POLYGON_API_KEY, bar_handler, trade_handler)
 
@@ -736,7 +763,8 @@ async def _amain():
             await asyncio.gather(
                 _polling_loop(polygon, bot, state, stop_evt,
                               prev_close_cache, day_high_cache,
-                              trade_vol_cache, day_open_cache),
+                              trade_vol_cache, day_open_cache,
+                              quiver=quiver),
                 ws_client.run(stop_evt),
             )
         finally:
